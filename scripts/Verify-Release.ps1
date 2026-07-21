@@ -37,6 +37,29 @@ if (-not [bool]$entry.IsTestingExclusive -or -not [bool]$sourceManifest.IsTestin
     throw 'The initial release must remain testing-exclusive.'
 }
 
+$effectiveRepoVersion = [string]$entry.AssemblyVersion
+$effectiveRepoApiLevel = [int]$entry.DalamudApiLevel
+if ([bool]$entry.IsTestingExclusive) {
+    if ($null -eq $entry.PSObject.Properties['TestingAssemblyVersion'] -or
+        [string]::IsNullOrWhiteSpace([string]$entry.TestingAssemblyVersion)) {
+        throw 'Testing-exclusive releases must declare TestingAssemblyVersion.'
+    }
+    if ($null -eq $entry.PSObject.Properties['TestingDalamudApiLevel']) {
+        throw 'Testing-exclusive releases must declare TestingDalamudApiLevel.'
+    }
+    if ($null -eq $entry.PSObject.Properties['DownloadLinkTesting'] -or
+        [string]::IsNullOrWhiteSpace([string]$entry.DownloadLinkTesting)) {
+        throw 'Testing-exclusive releases must declare DownloadLinkTesting.'
+    }
+
+    $effectiveRepoVersion = [string]$entry.TestingAssemblyVersion
+    $effectiveRepoApiLevel = [int]$entry.TestingDalamudApiLevel
+}
+
+if ($effectiveRepoApiLevel -ne 15) {
+    throw 'The effective repository API level must be 15.'
+}
+
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 $temporaryDll = [System.IO.Path]::GetTempFileName()
@@ -58,7 +81,12 @@ try {
     finally { $reader.Dispose() }
 
     if ($packedManifest.InternalName -ne $entry.InternalName) { throw 'Packed manifest InternalName differs.' }
-    if ($packedManifest.AssemblyVersion -ne $entry.AssemblyVersion) { throw 'Packed manifest version differs.' }
+    if ([string]$packedManifest.AssemblyVersion -ne $effectiveRepoVersion) {
+        throw "Packed manifest version differs from effective repo version $effectiveRepoVersion."
+    }
+    if ([int]$packedManifest.DalamudApiLevel -ne $effectiveRepoApiLevel) {
+        throw "Packed manifest API level differs from effective repo API level $effectiveRepoApiLevel."
+    }
 
     $dllEntry = $archive.GetEntry('PulseQueue.Plugin.dll')
     $input = $dllEntry.Open()
@@ -67,8 +95,8 @@ try {
     finally { $output.Dispose(); $input.Dispose() }
 
     $assemblyVersion = [System.Reflection.AssemblyName]::GetAssemblyName($temporaryDll).Version.ToString()
-    if ($assemblyVersion -ne $entry.AssemblyVersion) {
-        throw "DLL version $assemblyVersion differs from repo version $($entry.AssemblyVersion)."
+    if ($assemblyVersion -ne $effectiveRepoVersion) {
+        throw "DLL version $assemblyVersion differs from effective repo version $effectiveRepoVersion."
     }
 }
 finally {

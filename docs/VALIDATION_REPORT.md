@@ -17,8 +17,10 @@
   one replay call site, non-requeueing replay mode, protected native fields never
   written, no target writes, conflict gates present, immediate knockback
   invalidation, final generation check, and final monotonic deadline check.
-- Release ZIP structure, manifest/API/version consistency, DLL assembly version,
-  and source fingerprint pass the release verifier.
+- Release ZIP structure, testing-channel manifest/API/version consistency, DLL
+  assembly version, and source fingerprint pass the release verifier. The
+  verifier now models Dalamud's effective testing version selection so a missing
+  `TestingAssemblyVersion` or `TestingDalamudApiLevel` cannot be published again.
 
 Verified ZIP SHA-256:
 
