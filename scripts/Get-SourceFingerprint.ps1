@@ -12,7 +12,7 @@ $sourceRoots = @(
 
 $lines = foreach ($root in $sourceRoots) {
     Get-ChildItem -LiteralPath $root -Recurse -File |
-        Where-Object { $_.FullName -notmatch '[\/](bin|obj)[\/]' } |
+        Where-Object { $_.FullName -notmatch '[\\/](bin|obj)[\\/]' } |
         ForEach-Object {
             $relative = [System.IO.Path]::GetRelativePath($RepositoryRoot, $_.FullName).Replace('\', '/')
             $content = [System.IO.File]::ReadAllText($_.FullName).Replace("`r`n", "`n").Replace("`r", "`n")
