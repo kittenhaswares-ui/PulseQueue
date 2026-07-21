@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/PulseQueue.Core/PulseQueue.Core.csproj" />
+  <Project Path="src/PulseQueue.Plugin/PulseQueue.Plugin.csproj" />
+  <Project Path="tests/PulseQueue.Core.SelfTest/PulseQueue.Core.SelfTest.csproj" />
+</Solution>

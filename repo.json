@@ -1,0 +1,26 @@
+[
+  {
+    "Author": "kittenhaswares-ui",
+    "Name": "PulseQueue",
+    "Punchline": "One press. One action. Just when it becomes ready.",
+    "Description": "A strict one-shot smart input buffer with adaptive local timing, hard cancellation rules, and automatic suspension around incompatible action plugins.",
+    "InternalName": "PulseQueue.Plugin",
+    "AssemblyVersion": "0.1.0.0",
+    "Changelog": "Initial testing release: exact one-shot action buffering, 180 ms hard cap, adaptive local response timing, fail-closed cancellation, and live conflict suspension.",
+    "RepoUrl": "https://github.com/kittenhaswares-ui/PulseQueue",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "Tags": [
+      "utility",
+      "combat",
+      "pvp",
+      "latency"
+    ],
+    "IsHide": false,
+    "IsTestingExclusive": true,
+    "DownloadLinkInstall": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
+    "DownloadLinkUpdate": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
+    "DownloadLinkTesting": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
+    "LastUpdate": "1784643158"
+  }
+]

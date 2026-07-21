@@ -1,0 +1,19 @@
+{
+  "Author": "kittenhaswares-ui",
+  "Name": "PulseQueue",
+  "Punchline": "One press. One action. Just when it becomes ready.",
+  "Description": "A strict one-shot smart input buffer. It briefly preserves a rejected hotbar action and executes that exact action once when it becomes legal, with hard cancellation and conflict rules.",
+  "InternalName": "PulseQueue.Plugin",
+  "AssemblyVersion": "0.1.0.0",
+  "RepoUrl": "https://github.com/kittenhaswares-ui/PulseQueue",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 15,
+  "Tags": [
+    "utility",
+    "combat",
+    "pvp",
+    "latency"
+  ],
+  "IsHide": false,
+  "IsTestingExclusive": true
+}
