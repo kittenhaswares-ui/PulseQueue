@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.3.4.0 — 2026-07-22
+
+- Replaces the 0.3.3 manual Turbo implementation. Live evidence showed that
+  path was effectively inert and over-gated: ReAction compatibility rejected
+  most inputs, manual macro pulses produced no observed actions, and only two
+  direct pulses were emitted in the standalone sample. Version 0.3.4 does not
+  layer another exception onto that design; it removes it from the active path.
+- Repeats held standard-hotbar input at FFXIV's native logical input boundary.
+  While the game scans its standard-hotbar bindings, PulseQueue observes the
+  current `InputId` held state and, when cadence is due, reports that same input
+  as pressed. FFXIV then performs its normal binding, slot, action, target,
+  combo/transformation, and macro resolution.
+- Removes manual `ExecuteSlot`, action-tuple, and parsed-macro replay from the
+  Turbo path. Arbitrary and multi-action macros repeat as complete native slots;
+  PulseQueue neither selects a macro line nor substitutes an action or target.
+- Makes genuine physical input authoritative. The newest real press immediately
+  cancels one older pending smart-buffer intent and preempts only its exact
+  PulseQueue-owned native queue. A repeat injected by PulseQueue or delegated
+  to ReAction is classified as a repeat and can never cancel or replace the
+  newer player's intent.
+- Gives one logical input repeat ownership at a time. A newer input suppresses
+  the old held owner until that old input is released, so holding a Viper weave
+  cannot regain priority after the player presses Recuperate, Purify, Guard, or
+  another control.
+- Detects ReAction capabilities independently. When ReAction Turbo Hotbars is
+  active, PulseQueue delegates held-input repeat instead of creating a second
+  source. When ReAction Macro Queue is active, PulseQueue delegates macro action
+  queueing. Neither setting suspends the smart buffer. If ReAction is absent or
+  either feature is off, PulseQueue supplies the corresponding feature itself.
+- Keeps NoClippy compatible and downstream. PulseQueue reads normal client
+  readiness but never writes animation-lock state or competes with NoClippy's
+  correction.
+- Adds optional macro action queue mode without parsing macro content. It changes
+  only the native action mode for action calls emitted by a macro; the native
+  macro executor remains the sole owner of authored order, waits, targets, and
+  non-action commands.
+- Accepts initial-delay and repeat-interval settings from 0 through 1000 ms.
+- Limits native logical-input repeat in this testing release to standard hotbar
+  bindings. Cross hotbar/controller input and direct mouse clicks remain vanilla
+  and do not receive PulseQueue Turbo.
+- Retains the exact, at-most-once 180 ms smart buffer and terminal cancellation
+  rules. No alternative skill, target fallback, server-rejection retry, action
+  priority list, rotation, or FIFO weave backlog is introduced.
+
 ## 0.3.3.0 — 2026-07-22
 
 - Fixes the inactive 0.3.2 Turbo behavior seen in the live log: all 111 macro

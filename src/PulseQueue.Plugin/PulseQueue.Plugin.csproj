@@ -1,12 +1,12 @@
 <Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>0.3.3.0</Version>
-    <AssemblyVersion>0.3.3.0</AssemblyVersion>
-    <FileVersion>0.3.3.0</FileVersion>
+    <Version>0.3.4.0</Version>
+    <AssemblyVersion>0.3.4.0</AssemblyVersion>
+    <FileVersion>0.3.4.0</FileVersion>
     <AssemblyName>PulseQueue.Plugin</AssemblyName>
     <RootNamespace>PulseQueue.Plugin</RootNamespace>
     <Authors>kittenhaswares-ui</Authors>
-    <Description>A strict 180 ms one-shot buffer with same-slot Direct and action-only Macro Turbo.</Description>
+    <Description>A newest-input smart buffer with native logical-input Turbo and macro support.</Description>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>

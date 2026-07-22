@@ -8,7 +8,7 @@ internal static class PluginConfigurationTests
         yield return ("Turbo configuration defaults are opt-in", DefaultsAreOptIn);
         yield return ("schema 1 migrates to safe Turbo defaults", SchemaOneMigratesSafely);
         yield return ("schema 2 migrates with Macro Turbo off", SchemaTwoMigratesMacroTurboOff);
-        yield return ("schema 3 legacy cadence migrates to responsive defaults", SchemaThreeMigratesLegacyCadence);
+        yield return ("schema 3 cadence is preserved", SchemaThreePreservesLegacyCadence);
         yield return ("schema 3 custom cadence is preserved", SchemaThreePreservesCustomCadence);
         yield return ("Turbo timing is normalized before persistence", TimingNormalizesBeforePersistence);
         yield return ("future configuration fails closed without rewrite", FutureSchemaFailsClosedWithoutRewrite);
@@ -75,7 +75,7 @@ internal static class PluginConfigurationTests
         Same(configuration, persistence.LastSaved);
     }
 
-    private static void SchemaThreeMigratesLegacyCadence()
+    private static void SchemaThreePreservesLegacyCadence()
     {
         var persistence = new FakePluginInterface();
         var configuration = new PluginConfiguration
@@ -93,8 +93,8 @@ internal static class PluginConfigurationTests
         Equal(PluginConfiguration.CurrentVersion, configuration.Version);
         True(configuration.TurboEnabled);
         True(configuration.TurboMacrosEnabled);
-        Equal(PluginConfiguration.DefaultTurboInitialDelayMilliseconds, configuration.TurboInitialDelayMs);
-        Equal(PluginConfiguration.DefaultTurboRepeatIntervalMilliseconds, configuration.TurboRepeatIntervalMs);
+        Equal(180, configuration.TurboInitialDelayMs);
+        Equal(80, configuration.TurboRepeatIntervalMs);
         True(configuration.TurboOutOfCombat);
         Equal(1, persistence.SaveCount);
     }

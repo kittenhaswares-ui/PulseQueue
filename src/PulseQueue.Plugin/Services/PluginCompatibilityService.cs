@@ -14,6 +14,20 @@ internal sealed record PluginCompatibilityAssessment(
     string Signature)
 {
     public bool IsCompatible => Conflicts.IsEmpty;
+
+    // These flags are meaningful only when ReActionAudited is true. Keeping
+    // them as init-only properties preserves the record's existing constructor
+    // and deconstruction signature for callers that only consume the original
+    // compatibility surface.
+    public bool ReActionLoaded { get; init; }
+    public bool ReActionAudited { get; init; }
+    public bool ReActionTurboHotbarsEnabled { get; init; }
+    public bool ReActionTurboHotbarsOutOfCombatEnabled { get; init; }
+    public bool ReActionMacroQueueEnabled { get; init; }
+    public bool ReActionAutoTargetEnabled { get; init; }
+    public bool ReActionActionStacksEnabled { get; init; }
+    public bool ReActionAutoDismountEnabled { get; init; }
+    public bool ReActionCameraRelativeDirectionalsEnabled { get; init; }
 }
 
 /// <summary>
@@ -46,6 +60,7 @@ internal sealed class PluginCompatibilityService
         var conflicts = new List<string>();
         var integrations = new List<string>();
         var excludedActionIds = new HashSet<uint>();
+        var reAction = ReActionCompatibilityState.None;
 
         IExposedPlugin[] loadedPlugins;
         try
@@ -68,8 +83,14 @@ internal sealed class PluginCompatibilityService
         catch
         {
             conflicts.Add("The active plugin list could not be read; reload PulseQueue before enabling buffering.");
-            return CreateAssessment(conflicts, integrations, excludedActionIds);
+            return CreateAssessment(conflicts, integrations, excludedActionIds, reAction);
         }
+
+        reAction = reAction with
+        {
+            Loaded = loadedPlugins.Any(plugin =>
+                string.Equals(plugin.InternalName, "ReAction", StringComparison.OrdinalIgnoreCase)),
+        };
 
         try
         {
@@ -80,11 +101,7 @@ internal sealed class PluginCompatibilityService
                 plugin => AssessNoClippy(plugin, conflicts, integrations));
             AssessHardConflict(loadedPlugins, "NoClippyUnchained", conflicts,
                 "NoClippyUnchained is incompatible; disable it and use NoClippy 0.5.0.24 instead.");
-            AssessSingletonPlugin(
-                loadedPlugins,
-                "ReAction",
-                conflicts,
-                plugin => AssessReAction(plugin, conflicts, integrations));
+            reAction = AssessReActionPlugins(loadedPlugins, integrations);
             AssessHardConflict(loadedPlugins, "ReActionEx", conflicts,
                 "ReActionEx is incompatible; disable it and use the guarded ReAction 1.3.5.1 profile shown in PulseQueue settings.");
             AssessSingletonPlugin(
@@ -98,7 +115,7 @@ internal sealed class PluginCompatibilityService
             conflicts.Add("Plugin compatibility data could not be verified; reload PulseQueue before enabling buffering.");
         }
 
-        return CreateAssessment(conflicts, integrations, excludedActionIds);
+        return CreateAssessment(conflicts, integrations, excludedActionIds, reAction);
     }
 
     /// <summary>
@@ -193,75 +210,79 @@ internal sealed class PluginCompatibilityService
         integrations.Add($"NoClippy {SupportedNoClippyVersion} (animation-lock timing)");
     }
 
-    private void AssessReAction(
+    private ReActionCompatibilityState AssessReActionPlugins(
+        IEnumerable<IExposedPlugin> loadedPlugins,
+        ICollection<string> integrations)
+    {
+        var matches = loadedPlugins
+            .Where(plugin => string.Equals(plugin.InternalName, "ReAction", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (matches.Length == 0)
+        {
+            ClearLiveReActionGuard();
+            return ReActionCompatibilityState.None;
+        }
+
+        if (matches.Length > 1)
+        {
+            ClearLiveReActionGuard();
+            integrations.Add(
+                "Multiple loaded ReAction instances detected (feature capabilities unknown, PulseQueue remains available)");
+            return ReActionCompatibilityState.LoadedUnknown;
+        }
+
+        return AssessReAction(matches[0], integrations);
+    }
+
+    private ReActionCompatibilityState AssessReAction(
         IExposedPlugin plugin,
-        ICollection<string> conflicts,
         ICollection<string> integrations)
     {
         if (plugin.Version != SupportedReActionVersion)
         {
             ClearLiveReActionGuard();
-            conflicts.Add(
-                $"ReAction {plugin.Version} is not audited; install ReAction {SupportedReActionVersion} or disable it.");
-            return;
+            integrations.Add(
+                $"ReAction {plugin.Version} loaded (not audited; feature capabilities unknown, PulseQueue remains available)");
+            return ReActionCompatibilityState.LoadedUnknown;
         }
 
         if (!TryReadReActionConfiguration(plugin, out var configuration, out var liveConfiguration))
         {
             ClearLiveReActionGuard();
-            conflicts.Add(
-                $"ReAction {SupportedReActionVersion} settings could not be verified; reload ReAction or disable it.");
-            return;
+            integrations.Add(
+                $"ReAction {SupportedReActionVersion} loaded (settings unreadable; feature capabilities unknown, PulseQueue remains available)");
+            return ReActionCompatibilityState.LoadedUnknown;
         }
 
         SetLiveReActionGuard(liveConfiguration, configuration);
 
-        var safe = true;
-        if (configuration.ActionStackCount != 0)
-        {
-            conflicts.Add("ReAction Action Stacks must be empty while PulseQueue is enabled.");
-            safe = false;
-        }
+        // ReAction features are capabilities, not global compatibility gates.
+        // The action layer decides per input whether to delegate repetition,
+        // defer macro handling, or retain PulseQueue ownership.
+        integrations.Add(
+            $"ReAction {SupportedReActionVersion} (audited; "
+            + $"Turbo Hotbars={FormatCapability(configuration.TurboHotbarsEnabled)}, "
+            + $"Turbo out of combat={FormatCapability(configuration.TurboHotbarsOutOfCombatEnabled)}, "
+            + $"Macro Queue={FormatCapability(configuration.MacroQueueEnabled)}, "
+            + $"Auto Target={FormatCapability(configuration.AutoTargetEnabled)}, "
+            + $"Action Stacks={configuration.ActionStackCount}, "
+            + $"Auto Dismount={FormatCapability(configuration.AutoDismountEnabled)}, "
+            + $"Camera Relative Directionals={FormatCapability(configuration.CameraRelativeDirectionalsEnabled)})");
 
-        if (configuration.AutoTargetEnabled)
-        {
-            conflicts.Add("Disable ReAction's Auto Target while PulseQueue is enabled.");
-            safe = false;
-        }
-
-        if (configuration.TurboHotbarsEnabled)
-        {
-            conflicts.Add("Disable ReAction's Turbo Hotbars; PulseQueue native Turbo can replace it without competing repeat owners.");
-            safe = false;
-        }
-
-        if (configuration.MacroQueueEnabled)
-        {
-            conflicts.Add("Disable ReAction's Macro Queue; PulseQueue cannot prove exact macro ownership while ReAction rewrites macro action queue mode.");
-            safe = false;
-        }
-
-        // These capabilities operate only on inputs PulseQueue already refuses
-        // to own. Mounted presses fail the complete safety snapshot, and every
-        // movement/position-changing action (including ReAction's directionals
-        // exception) is excluded from buffering and Turbo. Keep the fields in
-        // the live snapshot so a settings change still invalidates active work,
-        // but do not globally suspend unrelated actions.
-        if (configuration.AutoDismountEnabled)
-        {
-            integrations.Add("ReAction Auto Dismount (mounted inputs passed through, never owned)");
-        }
-
-        if (configuration.CameraRelativeDirectionalsEnabled)
-        {
-            integrations.Add("ReAction Camera Relative Directionals (movement actions excluded)");
-        }
-
-        if (safe)
-        {
-            integrations.Add($"ReAction {SupportedReActionVersion} (audited guarded mode)");
-        }
+        return new ReActionCompatibilityState(
+            Loaded: true,
+            Audited: true,
+            TurboHotbarsEnabled: configuration.TurboHotbarsEnabled,
+            TurboHotbarsOutOfCombatEnabled: configuration.TurboHotbarsOutOfCombatEnabled,
+            MacroQueueEnabled: configuration.MacroQueueEnabled,
+            AutoTargetEnabled: configuration.AutoTargetEnabled,
+            ActionStacksEnabled: configuration.ActionStackCount != 0,
+            AutoDismountEnabled: configuration.AutoDismountEnabled,
+            CameraRelativeDirectionalsEnabled: configuration.CameraRelativeDirectionalsEnabled);
     }
+
+    private static string FormatCapability(bool enabled) => enabled ? "on" : "off";
 
     private bool TryReadReActionConfiguration(
         IExposedPlugin expectedPlugin,
@@ -339,6 +360,11 @@ internal sealed class PluginCompatibilityService
         if (!TryReadCollectionCount(configType, config, "ActionStacks", out var actionStackCount)
             || !TryReadBoolean(configType, config, "EnableAutoTarget", out var autoTargetEnabled)
             || !TryReadBoolean(configType, config, "EnableTurboHotbars", out var turboHotbarsEnabled)
+            || !TryReadBoolean(
+                configType,
+                config,
+                "EnableTurboHotbarsOutOfCombat",
+                out var turboHotbarsOutOfCombatEnabled)
             || !TryReadBoolean(configType, config, "EnableMacroQueue", out var macroQueueEnabled)
             || !TryReadBoolean(configType, config, "EnableAutoDismount", out var autoDismountEnabled)
             || !TryReadBoolean(
@@ -354,6 +380,7 @@ internal sealed class PluginCompatibilityService
             actionStackCount,
             autoTargetEnabled,
             turboHotbarsEnabled,
+            turboHotbarsOutOfCombatEnabled,
             macroQueueEnabled,
             autoDismountEnabled,
             cameraRelativeDirectionalsEnabled);
@@ -481,7 +508,8 @@ internal sealed class PluginCompatibilityService
     private static PluginCompatibilityAssessment CreateAssessment(
         IEnumerable<string> conflicts,
         IEnumerable<string> integrations,
-        IEnumerable<uint> excludedActionIds)
+        IEnumerable<uint> excludedActionIds,
+        ReActionCompatibilityState reAction)
     {
         var immutableConflicts = conflicts
             .Distinct(StringComparer.Ordinal)
@@ -497,6 +525,15 @@ internal sealed class PluginCompatibilityService
         foreach (var conflict in immutableConflicts) canonical.Append("\nconflict:").Append(conflict);
         foreach (var integration in immutableIntegrations) canonical.Append("\nintegration:").Append(integration);
         foreach (var actionId in immutableExcludedActionIds.Order()) canonical.Append("\nexcluded:").Append(actionId);
+        canonical.Append("\nreaction-loaded:").Append(reAction.Loaded);
+        canonical.Append("\nreaction-audited:").Append(reAction.Audited);
+        canonical.Append("\nreaction-turbo:").Append(reAction.TurboHotbarsEnabled);
+        canonical.Append("\nreaction-turbo-ooc:").Append(reAction.TurboHotbarsOutOfCombatEnabled);
+        canonical.Append("\nreaction-macro-queue:").Append(reAction.MacroQueueEnabled);
+        canonical.Append("\nreaction-auto-target:").Append(reAction.AutoTargetEnabled);
+        canonical.Append("\nreaction-action-stacks:").Append(reAction.ActionStacksEnabled);
+        canonical.Append("\nreaction-auto-dismount:").Append(reAction.AutoDismountEnabled);
+        canonical.Append("\nreaction-camera-directionals:").Append(reAction.CameraRelativeDirectionalsEnabled);
 
         var signatureBytes = SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString()));
         var signature = $"{AssessmentFormat}:{Convert.ToHexString(signatureBytes)}";
@@ -504,13 +541,49 @@ internal sealed class PluginCompatibilityService
             immutableConflicts,
             immutableIntegrations,
             immutableExcludedActionIds,
-            signature);
+            signature)
+        {
+            ReActionLoaded = reAction.Loaded,
+            ReActionAudited = reAction.Audited,
+            ReActionTurboHotbarsEnabled = reAction.TurboHotbarsEnabled,
+            ReActionTurboHotbarsOutOfCombatEnabled = reAction.TurboHotbarsOutOfCombatEnabled,
+            ReActionMacroQueueEnabled = reAction.MacroQueueEnabled,
+            ReActionAutoTargetEnabled = reAction.AutoTargetEnabled,
+            ReActionActionStacksEnabled = reAction.ActionStacksEnabled,
+            ReActionAutoDismountEnabled = reAction.AutoDismountEnabled,
+            ReActionCameraRelativeDirectionalsEnabled = reAction.CameraRelativeDirectionalsEnabled,
+        };
+    }
+
+    private readonly record struct ReActionCompatibilityState(
+        bool Loaded,
+        bool Audited,
+        bool TurboHotbarsEnabled,
+        bool TurboHotbarsOutOfCombatEnabled,
+        bool MacroQueueEnabled,
+        bool AutoTargetEnabled,
+        bool ActionStacksEnabled,
+        bool AutoDismountEnabled,
+        bool CameraRelativeDirectionalsEnabled)
+    {
+        public static ReActionCompatibilityState None => default;
+        public static ReActionCompatibilityState LoadedUnknown => new(
+            Loaded: true,
+            Audited: false,
+            TurboHotbarsEnabled: false,
+            TurboHotbarsOutOfCombatEnabled: false,
+            MacroQueueEnabled: false,
+            AutoTargetEnabled: false,
+            ActionStacksEnabled: false,
+            AutoDismountEnabled: false,
+            CameraRelativeDirectionalsEnabled: false);
     }
 
     private readonly record struct ReActionConfigurationSnapshot(
         int ActionStackCount,
         bool AutoTargetEnabled,
         bool TurboHotbarsEnabled,
+        bool TurboHotbarsOutOfCombatEnabled,
         bool MacroQueueEnabled,
         bool AutoDismountEnabled,
         bool CameraRelativeDirectionalsEnabled);

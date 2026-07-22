@@ -54,9 +54,17 @@ internal sealed record BufferDiagnostics(
     long NativeQueueBlocked,
     long OwnedNativeQueueReplacements,
     long OwnedNativeQueueSafetyClears,
+    long RepeatNativeQueueClaims,
+    long RepeatNativeQueueReplacements,
     long IntegrationExclusions,
     bool TurboConfigured,
     bool TurboInputAvailable,
+    long TurboPhysicalPresses,
+    long TurboInjectedRepeats,
+    long TurboDelegatedRepeats,
+    long TurboPreemptions,
+    long TurboReleases,
+    long TurboFailedOpenEvents,
     HoldRepeatState TurboState,
     long TurboStarts,
     long TurboPulses,
@@ -88,12 +96,20 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private const int CompatibilityPollIntervalMilliseconds = 500;
     private const long MaximumTurboAcknowledgementMilliseconds = 2_000;
     private const int MaximumMacroCaptureMilliseconds = 2_000;
+    private const int NativeMacroRepeatStartGraceMilliseconds = 100;
+    private const int LogicalRepeatQueueCorrelationMilliseconds = 250;
     private const uint ReActionCameraRelativeMovementException = 29494;
     private const uint DirectActionHotbarSlotType = 1;
     private const uint MacroHotbarSlotType = 7;
 
     [ThreadStatic]
     private static int hotbarExecutionDepth;
+
+    [ThreadStatic]
+    private static int logicalRepeatExecutionDepth;
+
+    [ThreadStatic]
+    private static NativeLogicalRepeatExecutionScope? activeLogicalRepeatExecution;
 
     [ThreadStatic]
     private static bool replaying;
@@ -124,6 +140,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private readonly BufferEngine engine = new();
     private readonly InputGenerationGate inputGenerations = new();
     private readonly NativeQueueOwnership nativeQueueOwnership = new();
+    private readonly RepeatNativeQueueOwnership logicalRepeatQueueOwnership = new();
     private readonly AdaptiveRttEstimator latency = new(new AdaptiveRttOptions
     {
         MinimumSuggestedHold = TimeSpan.FromMilliseconds(80),
@@ -149,10 +166,19 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private SyntheticMacroExecutorQuarantine? syntheticMacroExecutorQuarantine;
     private RetiredPhysicalMacroExecutor? retiredPhysicalMacroExecutor;
     private OwnedNativeQueueSafetyContext? ownedNativeQueueSafetyContext;
+    private LogicalRepeatQueuePending? logicalRepeatQueuePending;
+    private LogicalRepeatQueueAttempt? logicalRepeatQueueInFlight;
+    private NativeMacroRepeatTail? nativeMacroRepeatTail;
     private IReadOnlyList<string> activeConflicts = Array.Empty<string>();
     private IReadOnlyList<string> activeIntegrations = Array.Empty<string>();
     private IReadOnlySet<uint> excludedIntegrationActionIds = new HashSet<uint>();
     private string compatibilitySignature = string.Empty;
+    private bool reActionTurboHotbarsEnabled;
+    private bool reActionTurboHotbarsOutOfCombatEnabled;
+    private bool reActionMacroQueueEnabled;
+    private bool reActionLoaded;
+    private bool reActionAudited;
+    private bool reActionSmartActionTransformActive;
     private long nextCompatibilityRefreshAt;
     private int compatibilityQuarantineFrames;
     private int pluginTopologyDirty;
@@ -168,6 +194,9 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private long observedHotbarInputCount;
     private long replacedPendingCount;
     private long integrationExclusionCount;
+    private long logicalRepeatQueueClaimCount;
+    private long logicalRepeatQueueReplacementCount;
+    private long latestLogicalRepeatQueueReplacementGeneration;
     private long turboStartCount;
     private long turboPulseCount;
     private long turboAcceptedCount;
@@ -185,6 +214,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private bool faulted;
     private bool faultLogged;
     private bool disposed;
+    private NativeInputContext? lastNativeInputContext;
     private string turboInputUnavailableReason = string.Empty;
     private HoldRepeatCancelReason turboLastCancelReason;
     private string lastEvent = "Initialized";
@@ -217,13 +247,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
         {
             physicalHotbarInput = new PhysicalHotbarInputSource(
                 interop,
-                OnCertifiedPhysicalPress,
-                ShouldSuppressHeldRepeat);
+                GetNativeHotbarRepeatSettings,
+                OnCertifiedPhysicalPress);
         }
         catch (Exception exception)
         {
-            turboInputUnavailableReason = "physical keyboard input hook unavailable";
-            log.Warning(exception, "PulseQueue native Turbo is unavailable; the one-shot buffer will remain usable.");
+            turboInputUnavailableReason = "native logical hotbar input hooks unavailable";
+            log.Warning(exception, "PulseQueue native held-input Turbo is unavailable; the one-shot buffer will remain usable.");
         }
 
         useActionHook = interop.HookFromAddress<ActionManager.Delegates.UseAction>(
@@ -245,6 +275,9 @@ internal sealed unsafe class ActionBufferService : IDisposable
         get
         {
             var state = GetRuntimeState();
+            var nativeRepeat = physicalHotbarInput?.Telemetry;
+            var repeatSnapshot = physicalHotbarInput?.RepeatSnapshot;
+            var repeatCounters = repeatSnapshot?.Counters ?? default;
             return new BufferDiagnostics(
                 state,
                 DescribeState(state),
@@ -264,16 +297,26 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 nativeQueueBlockedCount,
                 ownedNativeQueueReplacementCount,
                 ownedNativeQueueSafetyClearCount,
+                logicalRepeatQueueClaimCount,
+                logicalRepeatQueueReplacementCount,
                 integrationExclusionCount,
                 configuration.TurboEnabled,
                 physicalHotbarInput is not null,
-                turboEngine.Snapshot.State,
-                turboStartCount,
-                turboPulseCount,
+                nativeRepeat?.PhysicalPresses ?? 0,
+                nativeRepeat?.InjectedRepeats ?? 0,
+                nativeRepeat?.DelegatedRepeats ?? 0,
+                nativeRepeat?.HoldsPreempted ?? 0,
+                nativeRepeat?.Releases ?? 0,
+                nativeRepeat?.FailedOpenEvents ?? 0,
+                repeatSnapshot is { HasOwner: true }
+                    ? HoldRepeatState.Active
+                    : HoldRepeatState.Idle,
+                repeatCounters.HoldsClaimed,
+                (nativeRepeat?.InjectedRepeats ?? 0) + (nativeRepeat?.DelegatedRepeats ?? 0),
                 physicalHotbarInput?.SuppressedHeldRepeatCount ?? 0,
-                turboAcceptedCount,
-                turboRejectedCount,
-                turboLastCancelReason,
+                nativeRepeat?.InjectedRepeats ?? 0,
+                nativeRepeat?.DelegatedRepeats ?? 0,
+                HoldRepeatCancelReason.None,
                 DescribeTurboState(),
                 engine.LastCancelReason,
                 lastEvent);
@@ -301,8 +344,8 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 {
                     DisposeSilently(inputSource);
                     physicalHotbarInput = null;
-                    turboInputUnavailableReason = "physical keyboard input hook could not be enabled";
-                    log.Warning(exception, "PulseQueue native Turbo is unavailable; the one-shot buffer remains enabled.");
+                    turboInputUnavailableReason = "native logical hotbar input hooks could not be enabled";
+                    log.Warning(exception, "PulseQueue native held-input Turbo is unavailable; the one-shot buffer remains enabled.");
                 }
             }
             framework.Update += OnFrameworkUpdate;
@@ -342,7 +385,63 @@ internal sealed unsafe class ActionBufferService : IDisposable
         if (reason == CancelReason.None) reason = CancelReason.Explicit;
         lock (dispatchGate)
         {
+            var actionManager = RequiresNativeInputRelease(reason)
+                ? ActionManager.Instance()
+                : null;
+            if (!configuration.DryRun && actionManager != null)
+            {
+                ResolveLogicalRepeatQueuePending(
+                    actionManager,
+                    NowMilliseconds,
+                    $"before terminal cancellation {reason}");
+            }
+            if (RequiresNativeInputRelease(reason))
+            {
+                if (logicalRepeatQueueInFlight is { } inFlight)
+                {
+                    inFlight.SupersededByTerminalCancellation = true;
+                }
+                if (logicalRepeatQueuePending is { } pending)
+                {
+                    pending.SupersededByTerminalCancellation = true;
+                }
+            }
+
             inputGenerations.Invalidate();
+            if (RequiresNativeInputRelease(reason))
+            {
+                var gatedInputs = physicalHotbarInput?.CancelAndRequireRelease() ?? 0;
+                latestLogicalRepeatQueueReplacementGeneration = inputGenerations.Current;
+                if (configuration.DryRun)
+                {
+                    AbandonOwnedQueueProvenanceForDetectOnly();
+                }
+                else if (actionManager != null)
+                {
+                    ResolveLogicalRepeatQueuePending(
+                        actionManager,
+                        NowMilliseconds,
+                        $"during terminal cancellation {reason}");
+                    TryReplaceLogicalRepeatNativeQueue(
+                        actionManager,
+                        latestLogicalRepeatQueueReplacementGeneration,
+                        $"during terminal cancellation {reason}");
+                }
+                else
+                {
+                    logicalRepeatQueueOwnership.Clear();
+                    logicalRepeatQueuePending = null;
+                }
+
+                if (gatedInputs > 0 && configuration.DetailedLogging)
+                {
+                    log.Information(
+                        "Native repeat cancellation {Reason} requires release for {Count} held logical input(s).",
+                        reason,
+                        gatedInputs);
+                }
+            }
+
             engine.Cancel(reason);
             pendingRuntimeAction = null;
             recentLocalActionEffects.Clear();
@@ -355,6 +454,11 @@ internal sealed unsafe class ActionBufferService : IDisposable
             lastEvent = detail;
         }
     }
+
+    private static bool RequiresNativeInputRelease(CancelReason reason) => reason is not (
+        CancelReason.None or
+        CancelReason.Replaced or
+        CancelReason.Dispatched);
 
     public void ClearFaultForReload()
     {
@@ -388,19 +492,49 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private byte ExecuteSlotDetour(RaptureHotbarModule* thisPtr, RaptureHotbarModule.HotbarSlot* slot)
     {
         var rootInput = hotbarExecutionDepth == 0 && !replaying && !turboDispatching;
+        var repeatRoot = false;
+        var managedRoot = false;
+        var suppressPreemptedRepeat = false;
+        NativeLogicalRepeatExecutionScope? repeatExecutionScope = null;
+        NativeMacroRepeatRootAttempt? macroRepeatRootAttempt = null;
         if (rootInput)
         {
             try
             {
-                CertifiedHotbarPress? certifiedPress = null;
-                if (physicalHotbarInput?.TryConsume(thisPtr, slot, NowMilliseconds, out var observedPress) == true)
+                HotbarActivation? activation = null;
+                if (physicalHotbarInput?.TryConsumeActivation(
+                        thisPtr,
+                        slot,
+                        NowMilliseconds,
+                        out var observedActivation) == true)
                 {
-                    certifiedPress = observedPress;
+                    activation = observedActivation;
+                    LogNativeRepeatActivation(observedActivation);
                 }
 
-                BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
-                PrepareCertifiedDirectQueueReplacement();
-                PrepareCertifiedMacroInput();
+                suppressPreemptedRepeat = activation is { SuppressedByNewerInput: true };
+                repeatRoot = activation is
+                {
+                    Kind: HotbarActivationKind.InjectedRepeat or HotbarActivationKind.DelegatedRepeat,
+                    SuppressedByNewerInput: false,
+                };
+                if (repeatRoot && activation is { } repeatedActivation)
+                {
+                    repeatExecutionScope = CreateNativeLogicalRepeatExecutionScope(repeatedActivation);
+                    macroRepeatRootAttempt = TryPrepareNativeMacroRepeatRoot(
+                        repeatExecutionScope,
+                        slot);
+                }
+                if (!suppressPreemptedRepeat && !repeatRoot)
+                {
+                    var certifiedPress = activation is { Kind: HotbarActivationKind.PhysicalPress }
+                        ? activation.Value.Press
+                        : (CertifiedHotbarPress?)null;
+                    BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
+                    PrepareCertifiedDirectQueueReplacement();
+                    PrepareCertifiedMacroInput();
+                    managedRoot = true;
+                }
             }
             catch (Exception exception)
             {
@@ -409,7 +543,18 @@ internal sealed unsafe class ActionBufferService : IDisposable
             }
         }
 
+        // A still-held older input may be reasserted by an outer repeat hook.
+        // It has no new physical edge and must not execute after a newer input
+        // took ownership.
+        if (suppressPreemptedRepeat) return 0;
+
         var originalCompleted = false;
+        var previousRepeatExecution = activeLogicalRepeatExecution;
+        if (repeatRoot)
+        {
+            logicalRepeatExecutionDepth++;
+            activeLogicalRepeatExecution = repeatExecutionScope;
+        }
         hotbarExecutionDepth++;
         try
         {
@@ -420,7 +565,19 @@ internal sealed unsafe class ActionBufferService : IDisposable
         finally
         {
             hotbarExecutionDepth--;
-            if (rootInput)
+            if (repeatRoot)
+            {
+                try
+                {
+                    CompleteNativeMacroRepeatRoot(macroRepeatRootAttempt, originalCompleted);
+                }
+                finally
+                {
+                    activeLogicalRepeatExecution = previousRepeatExecution;
+                    logicalRepeatExecutionDepth--;
+                }
+            }
+            if (managedRoot)
             {
                 if (originalCompleted) CompleteHotbarInput();
                 else activeHotbarInput = null;
@@ -431,20 +588,50 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private byte ExecuteSlotByIdDetour(RaptureHotbarModule* thisPtr, uint hotbarId, uint slotId)
     {
         var rootInput = hotbarExecutionDepth == 0 && !replaying && !turboDispatching;
+        var repeatRoot = false;
+        var managedRoot = false;
+        var suppressPreemptedRepeat = false;
+        NativeLogicalRepeatExecutionScope? repeatExecutionScope = null;
+        NativeMacroRepeatRootAttempt? macroRepeatRootAttempt = null;
         if (rootInput)
         {
             try
             {
-                CertifiedHotbarPress? certifiedPress = null;
-                if (physicalHotbarInput?.TryConsume(hotbarId, slotId, NowMilliseconds, out var observedPress) == true)
+                HotbarActivation? activation = null;
+                if (physicalHotbarInput?.TryConsumeActivation(
+                        hotbarId,
+                        slotId,
+                        NowMilliseconds,
+                        out var observedActivation) == true)
                 {
-                    certifiedPress = observedPress;
+                    activation = observedActivation;
+                    LogNativeRepeatActivation(observedActivation);
                 }
 
                 var slot = thisPtr == null ? null : thisPtr->GetSlotById(hotbarId, slotId);
-                BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
-                PrepareCertifiedDirectQueueReplacement();
-                PrepareCertifiedMacroInput();
+                suppressPreemptedRepeat = activation is { SuppressedByNewerInput: true };
+                repeatRoot = activation is
+                {
+                    Kind: HotbarActivationKind.InjectedRepeat or HotbarActivationKind.DelegatedRepeat,
+                    SuppressedByNewerInput: false,
+                };
+                if (repeatRoot && activation is { } repeatedActivation)
+                {
+                    repeatExecutionScope = CreateNativeLogicalRepeatExecutionScope(repeatedActivation);
+                    macroRepeatRootAttempt = TryPrepareNativeMacroRepeatRoot(
+                        repeatExecutionScope,
+                        slot);
+                }
+                if (!suppressPreemptedRepeat && !repeatRoot)
+                {
+                    var certifiedPress = activation is { Kind: HotbarActivationKind.PhysicalPress }
+                        ? activation.Value.Press
+                        : (CertifiedHotbarPress?)null;
+                    BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
+                    PrepareCertifiedDirectQueueReplacement();
+                    PrepareCertifiedMacroInput();
+                    managedRoot = true;
+                }
             }
             catch (Exception exception)
             {
@@ -453,7 +640,15 @@ internal sealed unsafe class ActionBufferService : IDisposable
             }
         }
 
+        if (suppressPreemptedRepeat) return 0;
+
         var originalCompleted = false;
+        var previousRepeatExecution = activeLogicalRepeatExecution;
+        if (repeatRoot)
+        {
+            logicalRepeatExecutionDepth++;
+            activeLogicalRepeatExecution = repeatExecutionScope;
+        }
         hotbarExecutionDepth++;
         try
         {
@@ -464,7 +659,19 @@ internal sealed unsafe class ActionBufferService : IDisposable
         finally
         {
             hotbarExecutionDepth--;
-            if (rootInput)
+            if (repeatRoot)
+            {
+                try
+                {
+                    CompleteNativeMacroRepeatRoot(macroRepeatRootAttempt, originalCompleted);
+                }
+                finally
+                {
+                    activeLogicalRepeatExecution = previousRepeatExecution;
+                    logicalRepeatExecutionDepth--;
+                }
+            }
+            if (managedRoot)
             {
                 if (originalCompleted) CompleteHotbarInput();
                 else activeHotbarInput = null;
@@ -486,11 +693,45 @@ internal sealed unsafe class ActionBufferService : IDisposable
         MacroQueueAttempt? macroQueueAttempt = null;
         DirectPulseAttempt? directPulseAttempt = null;
         NativeQueueDrainAttempt? nativeQueueDrainAttempt = null;
-        var suppressSyntheticMacroCall = false;
-        var nativeHotbarInput = hotbarExecutionDepth > 0 && !replaying && !turboDispatching;
-        var sequenceBefore = thisPtr == null ? (ushort)0 : thisPtr->LastUsedActionSequence;
+        LogicalRepeatQueueAttempt? logicalRepeatQueueAttempt = null;
+        var directLogicalRepeatInput = logicalRepeatExecutionDepth > 0;
+        var asynchronousLogicalRepeatInput = false;
+        var staleLogicalRepeatMacroTail = false;
+        NativeLogicalRepeatExecutionScope? asynchronousRepeatExecutionScope = null;
+        if (!directLogicalRepeatInput
+            && hotbarExecutionDepth == 0
+            && !replaying
+            && !turboDispatching
+            && IsPotentialNativeMacroRepeatTailMode(mode))
+        {
+            lock (dispatchGate)
+            {
+                ClassifyNativeMacroRepeatTail(
+                    NowMilliseconds,
+                    out asynchronousLogicalRepeatInput,
+                    out staleLogicalRepeatMacroTail,
+                    out asynchronousRepeatExecutionScope);
+            }
+        }
 
-        if (mode == ActionManager.UseActionMode.Macro)
+        var logicalRepeatInput = directLogicalRepeatInput || asynchronousLogicalRepeatInput;
+        var logicalRepeatExecution = directLogicalRepeatInput
+            ? activeLogicalRepeatExecution
+            : asynchronousRepeatExecutionScope;
+        var suppressSyntheticMacroCall = staleLogicalRepeatMacroTail;
+        var nativeHotbarInput = hotbarExecutionDepth > 0
+            && !logicalRepeatInput
+            && !replaying
+            && !turboDispatching;
+        var sequenceBefore = thisPtr == null ? (ushort)0 : thisPtr->LastUsedActionSequence;
+        var nativeMode = mode == ActionManager.UseActionMode.Macro
+            && CanOwnNativeMacroQueue()
+                ? ActionManager.UseActionMode.None
+                : mode;
+
+        if (!suppressSyntheticMacroCall
+            && !logicalRepeatInput
+            && mode == ActionManager.UseActionMode.Macro)
         {
             lock (dispatchGate)
             {
@@ -498,6 +739,48 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 ReconcileSyntheticMacroExecutorQuarantine(now);
                 ReconcileRetiredPhysicalMacroExecutor(now);
                 suppressSyntheticMacroCall = ShouldSuppressQuarantinedSyntheticMacroCall();
+            }
+        }
+
+        if (!suppressSyntheticMacroCall && logicalRepeatInput)
+        {
+            try
+            {
+                lock (dispatchGate)
+                {
+                    var createdAttempt = TryCreateLogicalRepeatQueueAttempt(
+                        logicalRepeatExecution,
+                        directLogicalRepeatInput,
+                        thisPtr,
+                        actionType,
+                        actionId,
+                        targetId,
+                        extraParam,
+                        nativeMode,
+                        comboRouteId,
+                        sequenceBefore);
+                    if (createdAttempt is not null && logicalRepeatQueueInFlight is null)
+                    {
+                        logicalRepeatQueueAttempt = createdAttempt;
+                        logicalRepeatQueueInFlight = createdAttempt;
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                // Provenance is optional bookkeeping. Losing it must never drop
+                // or replace the authoritative native/ReAction repeat call.
+                logicalRepeatQueueOwnership.Clear();
+                logicalRepeatQueuePending = null;
+                logicalRepeatQueueInFlight = null;
+                try
+                {
+                    Fault(exception, "Logical repeat queue provenance setup failed open");
+                }
+                catch
+                {
+                    // Original below remains authoritative even during teardown.
+                }
             }
         }
 
@@ -594,7 +877,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
             }
         }
 
-        if (!suppressSyntheticMacroCall && !replaying && !turboDispatching)
+        if (!suppressSyntheticMacroCall
+            && !logicalRepeatInput
+            && !replaying
+            && !turboDispatching)
         {
             lock (dispatchGate)
             {
@@ -847,13 +1133,18 @@ internal sealed unsafe class ActionBufferService : IDisposable
                     actionId,
                     targetId,
                     extraParam,
-                    mode,
+                    nativeMode,
                     comboRouteId,
                     outOptAreaTargeted);
                 originalCompleted = true;
             }
             finally
             {
+                if (!originalCompleted && logicalRepeatQueueAttempt is { } interruptedRepeat)
+                {
+                    ClearLogicalRepeatQueueInFlight(interruptedRepeat);
+                }
+
                 if (!originalCompleted && nativeQueueDrainAttempt is { } interruptedDrain)
                 {
                     // Never strand a non-reentrant lease if the authoritative
@@ -924,6 +1215,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 }
             }
 
+            if (logicalRepeatQueueAttempt is { } repeatedAttempt)
+            {
+                lock (dispatchGate)
+                {
+                    ProcessLogicalRepeatQueueAttempt(
+                        thisPtr,
+                        repeatedAttempt,
+                        currentSequence);
+                }
+            }
+
             if (candidate is { } captured)
             {
                 lock (dispatchGate)
@@ -941,6 +1243,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
         catch (Exception exception)
         {
             Fault(exception, "Original action outcome processing failed");
+        }
+        finally
+        {
+            if (logicalRepeatQueueAttempt is { } completedRepeat)
+            {
+                ClearLogicalRepeatQueueInFlight(completedRepeat);
+            }
         }
 
         return result;
@@ -972,6 +1281,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             // Observe the unlocked boundary before any newer root can start a
             // different native Macro and reuse MacroLocked (ABA).
             ReconcileRetiredPhysicalMacroExecutor(NowMilliseconds);
+            ReconcileNativeMacroRepeatTail(NowMilliseconds, observedUnlockedBoundary: true);
         }
 
         TryClearSyntheticMacroQuarantineForCertifiedRoot(activeHotbarInput);
@@ -1023,48 +1333,23 @@ internal sealed unsafe class ActionBufferService : IDisposable
         lock (dispatchGate)
         {
             if (activeHotbarInput is not { } scope
-                || scope.CertifiedPress is not { } press
-                || scope.SlotIdentity is not { CommandType: MacroHotbarSlotType } slotIdentity
-                || scope.MacroWasLockedBeforeExecution
-                || scope.MacroSnapshotAtPress is not { } snapshot
+                || scope.CertifiedPress is null
+                || scope.SlotIdentity is not { CommandType: MacroHotbarSlotType }
                 || !configuration.Enabled
                 || configuration.DryRun
-                || activeConflicts.Count > 0
-                || compatibilityQuarantineFrames > 0
-                || !inputGenerations.IsCurrent(scope.Generation)
-                || Volatile.Read(ref latestCertifiedPressId) != press.PressId
-                || !TryReadCurrentSlotIdentity(press, out var currentIdentity)
-                || currentIdentity != slotIdentity
-                || !compatibility.IsLiveReActionProfileCurrent()
-                || !TryReadSafeMacroProfile(slotIdentity, out var profile, out _))
+                || !inputGenerations.IsCurrent(scope.Generation))
             {
                 return;
             }
 
-            // Static action-only certification is sufficient to grant the new
-            // physical Macro root priority over an older exact owned queue. It
-            // does not grant ownership of the new Macro outcome or Turbo.
+            // Input priority is independent of macro contents. The player pressed
+            // this exact native hotbar control, so it may supersede an older exact
+            // PulseQueue-owned queue before FFXIV evaluates the authored macro.
+            // PulseQueue deliberately does not parse, select, budget, or suppress
+            // macro lines here; the native macro engine remains the sole executor.
             ArmCertifiedOwnedQueueReplacement(
                 scope,
-                "before the newest certified action-only Macro hotbar root");
-
-            if (!IsSafeSnapshot(snapshot))
-            {
-                // Leave the physical Macro entirely vanilla. This lets an
-                // authored Purify/Guard line run under its native rules while
-                // terminal state still forbids all PulseQueue scheduling and
-                // prevents PulseQueue from claiming the new queue outcome.
-                return;
-            }
-
-            // Certify the complete safe macro before its first command can run.
-            // This marker is also required when the hold runtime is created
-            // after the native slot call.
-            scope.MacroProfileAtPress = profile;
-            // This budget only observes the untouched physical Macro and proves
-            // exact queue ownership. TryStartTurbo separately enforces every
-            // repeat opt-in, combat policy, and continuing-hold requirement.
-            scope.MacroExecutionBudget = new MacroTurboExecutionBudget(profile.ActionCount);
+                "before the newest certified native Macro hotbar root");
         }
     }
 
@@ -1093,9 +1378,61 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 if (disposed) return;
                 Volatile.Write(ref latestCertifiedPressId, press.PressId);
                 if (engine.Pending is not null) replacedPendingCount++;
+                MarkLogicalRepeatInFlightSupersededBy(press);
+                var actionManager = ActionManager.Instance();
+                if (!configuration.DryRun && actionManager != null)
+                {
+                    ResolveLogicalRepeatQueuePending(
+                        actionManager,
+                        NowMilliseconds,
+                        "immediately before the newest physical logical hotbar edge");
+                }
+
                 Cancel(
                     CancelReason.Replaced,
                     $"Physical hotbar press {press.PressId} preempted every older buffered or Turbo owner");
+
+                // Input priority is decided at the real logical press edge, not
+                // after action/slot classification. This lets Guard, Purify,
+                // Recuperate, items, macros, combo slots, and other hotbar
+                // commands immediately replace one exact older PulseQueue-owned
+                // native queue. Foreign queues are never touched.
+                latestCertifiedQueueReplacementGeneration = inputGenerations.Current;
+                latestLogicalRepeatQueueReplacementGeneration = inputGenerations.Current;
+                if (configuration.DryRun)
+                {
+                    AbandonOwnedQueueProvenanceForDetectOnly();
+                }
+                else if (CanReplaceOwnedQueuesForNewestInput() && actionManager != null)
+                {
+                    TryReplaceLogicalRepeatNativeQueue(
+                        actionManager,
+                        latestLogicalRepeatQueueReplacementGeneration,
+                        "at the newest physical logical hotbar edge");
+                    TryReplaceOwnedNativeQueue(
+                        actionManager,
+                        latestCertifiedQueueReplacementGeneration,
+                        "at the newest physical logical hotbar edge");
+                }
+
+                if (!IsNativeRepeatOwnershipAllowedNow())
+                {
+                    // The physical tap still preempted older exact ownership and
+                    // remains fully vanilla, but a hold begun during a persistent
+                    // terminal state may not resume Turbo when that state clears.
+                    physicalHotbarInput?.CancelAndRequireRelease();
+                    lastEvent = $"Physical hotbar press {press.PressId} passed through but must release before Turbo can resume";
+                }
+
+                if (configuration.DetailedLogging)
+                {
+                    log.Information(
+                        "Native hotbar edge press={PressId}, input={InputId}, hotbar={Hotbar}, slot={Slot}; every older PulseQueue intent was preempted.",
+                        press.PressId,
+                        press.Binding.InputId,
+                        press.Binding.HotbarId + 1,
+                        press.Binding.SlotId + 1);
+                }
             }
         }
         catch (Exception exception)
@@ -1115,31 +1452,553 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
-    private bool ShouldSuppressHeldRepeat(CertifiedHotbarPress press)
+    private NativeHotbarRepeatSettings GetNativeHotbarRepeatSettings()
+    {
+        // This callback runs at the beginning of the native binding scan, before
+        // any logical hotbar edge is certified. Processing terminal transitions
+        // here prevents a stun/target/zone change between framework ticks from
+        // being erased by the next press.
+        ObserveNativeInputContextTransitions();
+
+        var liveReActionProfileCurrent = !reActionLoaded
+            || reActionAudited && compatibility.IsLiveReActionProfileCurrent();
+        var pluginOperational = configuration.Enabled
+            && !faulted
+            && !disposed;
+        var featureEnabled = pluginOperational
+            && configuration.TurboEnabled
+            && !configuration.DryRun
+            && activeConflicts.Count == 0
+            && compatibilityQuarantineFrames == 0
+            && IsNativeRepeatOwnershipAllowedNow()
+            && liveReActionProfileCurrent
+            && (!reActionLoaded || reActionAudited)
+            && !reActionSmartActionTransformActive;
+        var repeatEnabled = featureEnabled
+            && (configuration.TurboOutOfCombat || condition[ConditionFlag.InCombat]);
+        var reActionRepeatActive = pluginOperational
+            && !configuration.DryRun
+            && reActionLoaded
+            && (!reActionAudited
+                || !liveReActionProfileCurrent
+                || Volatile.Read(ref reActionTurboHotbarsEnabled)
+                    && (condition[ConditionFlag.InCombat]
+                        || Volatile.Read(ref reActionTurboHotbarsOutOfCombatEnabled)));
+
+        return new NativeHotbarRepeatSettings(
+            RepeatEnabled: repeatEnabled,
+            ExternalRepeatOwnerActive: reActionRepeatActive,
+            InitialDelayMilliseconds: configuration.TurboInitialDelayMs,
+            RepeatIntervalMilliseconds: configuration.TurboRepeatIntervalMs);
+    }
+
+    private bool IsNativeRepeatOwnershipAllowedNow()
+    {
+        var local = objectTable.LocalPlayer;
+        return configuration.Enabled
+            && !configuration.DryRun
+            && !faulted
+            && !disposed
+            && activeConflicts.Count == 0
+            && compatibilityQuarantineFrames == 0
+            && clientState.IsLoggedIn
+            && local is { IsDead: false }
+            && !condition[ConditionFlag.Unconscious]
+            && !condition[ConditionFlag.Mounted]
+            && !IsStunned(local)
+            && !condition[ConditionFlag.BeingMoved]
+            && !IsBetweenAreas;
+    }
+
+    private void LogNativeRepeatActivation(HotbarActivation activation)
+    {
+        if (!configuration.DetailedLogging
+            || activation.Kind == HotbarActivationKind.PhysicalPress)
+        {
+            return;
+        }
+
+        log.Debug(
+            "Native hotbar repeat kind={Kind}, input={InputId}, hotbar={Hotbar}, slot={Slot}, suppressedByNewer={Suppressed}.",
+            activation.Kind,
+            activation.Binding.InputId,
+            activation.Binding.HotbarId + 1,
+            activation.Binding.SlotId + 1,
+            activation.SuppressedByNewerInput);
+    }
+
+    private NativeLogicalRepeatExecutionScope CreateNativeLogicalRepeatExecutionScope(
+        HotbarActivation activation)
+    {
+        var actionManager = ActionManager.Instance();
+        return new NativeLogicalRepeatExecutionScope(
+            inputGenerations.Current,
+            activation.Press.PressId,
+            activation.Binding,
+            activation.ObservedAtMilliseconds,
+            CaptureNativeQueue(actionManager),
+            actionManager == null ? (ushort)0 : actionManager->LastUsedActionSequence,
+            reActionLoaded
+                && reActionAudited
+                && reActionMacroQueueEnabled
+                && compatibility.IsLiveReActionProfileCurrent());
+    }
+
+    private NativeMacroRepeatRootAttempt? TryPrepareNativeMacroRepeatRoot(
+        NativeLogicalRepeatExecutionScope? execution,
+        RaptureHotbarModule.HotbarSlot* slot)
+    {
+        if (execution is null
+            || slot == null
+            || (uint)slot->CommandType != MacroHotbarSlotType
+            || !configuration.Enabled
+            || configuration.DryRun
+            || faulted
+            || disposed)
+        {
+            return null;
+        }
+
+        lock (dispatchGate)
+        {
+            if (IsMacroExecutionActive()) return null;
+
+            var now = NowMilliseconds;
+            // MacroLocked=false immediately before this exact root is an observed
+            // unlocked boundary. It closes any older tail before a new executor
+            // can reuse the global MacroLocked bit (ABA).
+            ReconcileNativeMacroRepeatTail(now, observedUnlockedBoundary: true);
+            return new NativeMacroRepeatRootAttempt(
+                execution,
+                now,
+                SaturatingAdd(now, MaximumMacroCaptureMilliseconds));
+        }
+    }
+
+    private void CompleteNativeMacroRepeatRoot(
+        NativeMacroRepeatRootAttempt? attempt,
+        bool originalCompleted)
+    {
+        if (attempt is null) return;
+
+        try
+        {
+            lock (dispatchGate)
+            {
+                if (!originalCompleted
+                    || !configuration.Enabled
+                    || configuration.DryRun
+                    || faulted
+                    || disposed
+                    || !IsMacroExecutionActive()
+                    || nativeMacroRepeatTail is not null)
+                {
+                    return;
+                }
+
+                // The token is committed only after the exact repeated slot returned
+                // with MacroLocked active. It remains generation-bound even if a
+                // newer physical press arrived re-entrantly while Original ran.
+                nativeMacroRepeatTail = new NativeMacroRepeatTail(
+                    attempt.Execution,
+                    attempt.StartedAtMilliseconds,
+                    attempt.DiagnosticDeadlineMilliseconds)
+                {
+                    MacroLockObserved = true,
+                };
+            }
+        }
+        catch (Exception exception)
+        {
+            nativeMacroRepeatTail = null;
+            try
+            {
+                Fault(exception, "Native Macro repeat tail completion failed open");
+            }
+            catch
+            {
+                // ExecuteSlot's already-completed native result remains authoritative.
+            }
+        }
+    }
+
+    private bool IsPotentialNativeMacroRepeatTailMode(
+        ActionManager.UseActionMode mode) =>
+        mode == ActionManager.UseActionMode.Macro
+        || (uint)mode == 100
+        || mode == ActionManager.UseActionMode.None
+            && nativeMacroRepeatTail?.Execution.ReActionMacroQueueAtRoot == true;
+
+    private void ClassifyNativeMacroRepeatTail(
+        long now,
+        out bool currentTail,
+        out bool staleTail,
+        out NativeLogicalRepeatExecutionScope? execution)
+    {
+        currentTail = false;
+        staleTail = false;
+        execution = null;
+        ReconcileNativeMacroRepeatTail(now, observedUnlockedBoundary: false);
+        if (nativeMacroRepeatTail is not { } tail) return;
+
+        // None is a possible Macro tail only when audited ReAction Macro Queue
+        // owns the conversion. Queue-mode drains and ordinary direct roots never
+        // enter this classifier.
+        execution = tail.Execution;
+        var isCurrent = inputGenerations.IsCurrent(tail.Execution.Generation);
+        if (isCurrent)
+        {
+            currentTail = true;
+        }
+        else
+        {
+            staleTail = true;
+        }
+    }
+
+    private void ReconcileNativeMacroRepeatTail(
+        long now,
+        bool observedUnlockedBoundary)
+    {
+        if (nativeMacroRepeatTail is not { } tail) return;
+
+        var macroLocked = IsMacroExecutionActive();
+        if (macroLocked)
+        {
+            tail.MacroLockObserved = true;
+            if (now >= tail.DiagnosticDeadlineMilliseconds && !tail.TimeoutReported)
+            {
+                tail.TimeoutReported = true;
+                if (configuration.DetailedLogging)
+                {
+                    log.Warning(
+                        "Native repeat Macro tail exceeded {Timeout} ms; provenance remains fail-closed until MacroLocked is observed false.",
+                        MaximumMacroCaptureMilliseconds);
+                }
+            }
+
+            return;
+        }
+
+        if (observedUnlockedBoundary
+            || tail.MacroLockObserved
+            || now - tail.StartedAtMilliseconds >= NativeMacroRepeatStartGraceMilliseconds)
+        {
+            nativeMacroRepeatTail = null;
+        }
+    }
+
+    private bool CanOwnNativeMacroQueue() =>
+        configuration.Enabled
+        && configuration.TurboMacrosEnabled
+        && !configuration.DryRun
+        && !faulted
+        && !disposed
+        && activeConflicts.Count == 0
+        && compatibilityQuarantineFrames == 0
+        && (!reActionLoaded
+            || reActionAudited
+                && compatibility.IsLiveReActionProfileCurrent()
+                && !reActionMacroQueueEnabled
+                && !reActionSmartActionTransformActive);
+
+    private LogicalRepeatQueueAttempt? TryCreateLogicalRepeatQueueAttempt(
+        NativeLogicalRepeatExecutionScope? execution,
+        bool allowDeferredOuterHookCorrelation,
+        ActionManager* actionManager,
+        ActionType actionType,
+        uint actionId,
+        ulong targetId,
+        uint extraParam,
+        ActionManager.UseActionMode mode,
+        uint comboRouteId,
+        ushort sequenceBefore)
+    {
+        if (execution is null
+            || actionManager == null
+            || actionId == 0
+            || !configuration.Enabled
+            || configuration.DryRun
+            || faulted
+            || disposed)
+        {
+            return null;
+        }
+
+        var resolvedActionId = actionManager->GetAdjustedActionId(actionId);
+        if (resolvedActionId == 0) resolvedActionId = actionId;
+        var expectedMode = ((uint)mode == 100
+            || execution.ReActionMacroQueueAtRoot
+                && mode is ActionManager.UseActionMode.Macro or ActionManager.UseActionMode.None)
+                ? ActionManager.UseActionMode.None
+                : mode;
+        var expected = new ExactActionTuple(
+            (uint)actionType,
+            actionId,
+            resolvedActionId,
+            targetId,
+            extraParam,
+            (uint)expectedMode,
+            comboRouteId);
+        if (!expected.IsValid) return null;
+
+        return new LogicalRepeatQueueAttempt(
+            execution,
+            CaptureNativeQueue(actionManager),
+            expected,
+            sequenceBefore,
+            NowMilliseconds,
+            allowDeferredOuterHookCorrelation);
+    }
+
+    private void ProcessLogicalRepeatQueueAttempt(
+        ActionManager* actionManager,
+        LogicalRepeatQueueAttempt attempt,
+        ushort currentSequence)
+    {
+        if (actionManager == null
+            || configuration.DryRun
+            || !configuration.Enabled
+            || faulted
+            || disposed)
+        {
+            logicalRepeatQueueOwnership.Clear();
+            logicalRepeatQueuePending = null;
+            return;
+        }
+
+        var queueAfter = CaptureNativeQueue(actionManager);
+        var sequenceUnchanged = currentSequence == attempt.SequenceBefore;
+        var generationCurrent = inputGenerations.IsCurrent(attempt.Execution.Generation);
+        var generationAttributable = generationCurrent
+            || attempt.SupersededByTerminalCancellation
+            || attempt.SupersededByProvablyDifferentPhysicalInput
+                && !reActionSmartActionTransformActive;
+        var observedNewQueue = generationAttributable
+            && sequenceUnchanged
+            && queueAfter.IsQueued
+            && !queueAfter.Equals(attempt.QueueBefore)
+            && queueAfter.Matches(attempt.Expected);
+        if (observedNewQueue)
+        {
+            if (logicalRepeatQueueOwnership.TryClaimFromObservedDelta(
+                    attempt.Execution.Generation,
+                    currentSequence,
+                    attempt.QueueBefore,
+                    queueAfter,
+                    attempt.Expected))
+            {
+                logicalRepeatQueueClaimCount++;
+                logicalRepeatQueuePending = null;
+            }
+        }
+        else if (generationAttributable
+            && sequenceUnchanged
+            && attempt.AllowDeferredOuterHookCorrelation
+            && attempt.Execution.SequenceAtRoot == attempt.SequenceBefore
+            && !attempt.Execution.QueueAtRoot.Matches(attempt.Expected)
+            && !attempt.QueueBefore.Matches(attempt.Expected)
+            && !attempt.QueueBefore.IsQueued
+            && !queueAfter.IsQueued)
+        {
+            // One narrowly bounded compatibility window: an outer hook may create
+            // or restore the exact queue only after this inner detour returns.
+            // Resolution is allowed before the next input or at one stable frame.
+            logicalRepeatQueuePending = new LogicalRepeatQueuePending(
+                attempt.Execution,
+                attempt.QueueBefore,
+                attempt.Expected,
+                currentSequence,
+                SaturatingAdd(NowMilliseconds, LogicalRepeatQueueCorrelationMilliseconds))
+            {
+                SupersededByProvablyDifferentPhysicalInput =
+                    attempt.SupersededByProvablyDifferentPhysicalInput,
+                SupersededByTerminalCancellation =
+                    attempt.SupersededByTerminalCancellation,
+            };
+        }
+        else
+        {
+            logicalRepeatQueuePending = null;
+        }
+
+        if (latestLogicalRepeatQueueReplacementGeneration > attempt.Execution.Generation)
+        {
+            TryReplaceLogicalRepeatNativeQueue(
+                actionManager,
+                latestLogicalRepeatQueueReplacementGeneration,
+                "after an older logical repeat returned beneath a newer input");
+        }
+    }
+
+    private void MarkLogicalRepeatInFlightSupersededBy(CertifiedHotbarPress press)
+    {
+        if (logicalRepeatQueueInFlight is null
+            && logicalRepeatQueuePending is null)
+        {
+            return;
+        }
+
+        if (!TryReadCurrentSlotIdentity(press, out var newerSlot)
+            || newerSlot.CommandType != DirectActionHotbarSlotType
+            || newerSlot.CommandId == 0)
+        {
+            return;
+        }
+
+        var actionManager = ActionManager.Instance();
+        var newerResolvedId = actionManager == null
+            ? newerSlot.CommandId
+            : actionManager->GetAdjustedActionId(newerSlot.CommandId);
+        if (newerResolvedId == 0) newerResolvedId = newerSlot.CommandId;
+
+        if (logicalRepeatQueueInFlight is { } inFlight
+            && inFlight.Execution.PressId != press.PressId)
+        {
+            inFlight.SupersededByProvablyDifferentPhysicalInput = IsProvablyDifferent(
+                inFlight.Expected,
+                newerSlot.CommandId,
+                newerResolvedId);
+        }
+
+        if (logicalRepeatQueuePending is { } pending
+            && pending.Execution.PressId != press.PressId)
+        {
+            pending.SupersededByProvablyDifferentPhysicalInput = IsProvablyDifferent(
+                pending.Expected,
+                newerSlot.CommandId,
+                newerResolvedId);
+        }
+    }
+
+    private static bool IsProvablyDifferent(
+        ExactActionTuple older,
+        uint newerRequestedId,
+        uint newerResolvedId) =>
+        newerRequestedId != older.RequestedActionId
+        && newerRequestedId != older.ResolvedActionId
+        && newerResolvedId != older.RequestedActionId
+        && newerResolvedId != older.ResolvedActionId;
+
+    private void ClearLogicalRepeatQueueInFlight(LogicalRepeatQueueAttempt attempt)
     {
         lock (dispatchGate)
         {
-            if (disposed
-                || faulted
-                || !configuration.Enabled
-                || !configuration.TurboEnabled
-                || configuration.DryRun)
+            if (ReferenceEquals(logicalRepeatQueueInFlight, attempt))
             {
-                return false;
+                logicalRepeatQueueInFlight = null;
             }
-
-            // Once a newer physical edge wins, an older still-held key may not
-            // revive through OS/native typematic. The player must release it and
-            // create a genuinely new hardware edge.
-            if (Volatile.Read(ref latestCertifiedPressId) > press.PressId)
-            {
-                return true;
-            }
-
-            return turboEngine.Snapshot.HasActiveHold
-                && (turboRuntime?.Press.PressId == press.PressId
-                    || macroTurboRuntime?.Press.PressId == press.PressId);
         }
+    }
+
+    private void ResolveLogicalRepeatQueuePending(
+        ActionManager* actionManager,
+        long now,
+        string phase,
+        bool stableBoundary = false)
+    {
+        if (logicalRepeatQueuePending is not { } pending || actionManager == null) return;
+        var generationCurrent = inputGenerations.IsCurrent(pending.Execution.Generation);
+        var generationAttributable = generationCurrent
+            || pending.SupersededByTerminalCancellation
+            || pending.SupersededByProvablyDifferentPhysicalInput
+                && !reActionSmartActionTransformActive;
+        if (!generationAttributable)
+        {
+            logicalRepeatQueuePending = null;
+            return;
+        }
+
+        var current = CaptureNativeQueue(actionManager);
+        var currentSequence = actionManager->LastUsedActionSequence;
+        if (currentSequence != pending.SequenceMarker
+            || now > pending.ExpiresAtMilliseconds)
+        {
+            logicalRepeatQueuePending = null;
+            return;
+        }
+
+        if (current.IsQueued)
+        {
+            if (current.Matches(pending.Expected)
+                && !pending.QueueBefore.Matches(pending.Expected)
+                && logicalRepeatQueueOwnership.TryClaimFromObservedDelta(
+                    pending.Execution.Generation,
+                    currentSequence,
+                    pending.QueueBefore,
+                    current,
+                    pending.Expected))
+            {
+                logicalRepeatQueueClaimCount++;
+            }
+
+            logicalRepeatQueuePending = null;
+        }
+        else if (stableBoundary)
+        {
+            // The outer-hook correlation window is exactly one stable boundary;
+            // an empty queue here is not causally attributable to the old call.
+            logicalRepeatQueuePending = null;
+        }
+
+        if (latestLogicalRepeatQueueReplacementGeneration > pending.Execution.Generation)
+        {
+            TryReplaceLogicalRepeatNativeQueue(
+                actionManager,
+                latestLogicalRepeatQueueReplacementGeneration,
+                phase);
+        }
+    }
+
+    private bool TryReplaceLogicalRepeatNativeQueue(
+        ActionManager* actionManager,
+        long replacingGeneration,
+        string phase)
+    {
+        if (actionManager == null || configuration.DryRun) return false;
+        var current = CaptureNativeQueue(actionManager);
+        if (!current.IsQueued) return false;
+        if (!logicalRepeatQueueOwnership.TryTakeForNewerInput(
+                replacingGeneration,
+                actionManager->LastUsedActionSequence,
+                current,
+                out var replaced))
+        {
+            return false;
+        }
+
+        actionManager->ActionQueued = false;
+        logicalRepeatQueueReplacementCount++;
+        lastEvent = $"Newest input replaced repeat-owned native queue action {replaced.ActionId}";
+        if (configuration.DetailedLogging)
+        {
+            log.Information(
+                "Replaced repeat-owned native queue action={Action}, generation={Generation}, phase={Phase}.",
+                replaced.ActionId,
+                replacingGeneration,
+                phase);
+        }
+
+        return true;
+    }
+
+    private bool CanReplaceOwnedQueuesForNewestInput() =>
+        configuration.Enabled
+        && !configuration.DryRun
+        && !faulted
+        && !disposed;
+
+    private void AbandonOwnedQueueProvenanceForDetectOnly()
+    {
+        nativeQueueOwnership.Clear();
+        logicalRepeatQueueOwnership.Clear();
+        ownedNativeQueueSafetyContext = null;
+        logicalRepeatQueuePending = null;
+        logicalRepeatQueueInFlight = null;
+        ownedNativeQueueSafetyClearPending = false;
+        ownedNativeQueueSafetyClearThroughGeneration = 0;
+        latestCertifiedQueueReplacementGeneration = 0;
+        latestLogicalRepeatQueueReplacementGeneration = 0;
     }
 
     private static bool IsMacroTargetProven(Candidate candidate) =>
@@ -2538,7 +3397,9 @@ internal sealed unsafe class ActionBufferService : IDisposable
                     TryReplaceOwnedNativeQueue(actionManager, scope.Generation, "after the complete hotbar call");
                 }
 
-                TryStartTurbo(scope);
+                // Held-input repetition is produced upstream by
+                // PhysicalHotbarInputSource at the native logical-input boundary.
+                // Never replay ExecuteSlot or actions from this completion path.
             }
         }
         catch (Exception exception)
@@ -3730,7 +4591,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         long replacingGeneration,
         string phase)
     {
-        if (actionManager == null) return false;
+        if (actionManager == null || !CanReplaceOwnedQueuesForNewestInput()) return false;
         var current = CaptureNativeQueue(actionManager);
         // ReAction may temporarily hide an older queue around its outer hook and
         // restore it only after PulseQueue's inner UseAction returns. Preserve
@@ -3799,6 +4660,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
         ActionManager* actionManager,
         string phase)
     {
+        if (configuration.DryRun)
+        {
+            AbandonOwnedQueueProvenanceForDetectOnly();
+            return false;
+        }
+
         if (!ownedNativeQueueSafetyClearPending
             || ownedNativeQueueSafetyClearThroughGeneration <= 0
             || actionManager == null)
@@ -3860,6 +4727,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
         ActionManager* actionManager,
         string phase)
     {
+        if (!configuration.Enabled
+            || configuration.DryRun
+            || faulted
+            || disposed
+            || reActionSmartActionTransformActive
+            || activeConflicts.Count > 0
+            || compatibilityQuarantineFrames > 0)
+        {
+            return false;
+        }
+
         var claimed = nativeQueueOwnership.TryClaimNewQueue(
             generation,
             sequenceMarker,
@@ -4276,7 +5154,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
         uint comboRouteId,
         ActionManager.UseActionMode requiredMode = ActionManager.UseActionMode.None)
     {
-        if (disposed || faulted || !configuration.Enabled || actionManager == null || mode != requiredMode)
+        if (disposed
+            || faulted
+            || !configuration.Enabled
+            || reActionSmartActionTransformActive
+            || actionManager == null
+            || mode != requiredMode)
         {
             return null;
         }
@@ -4660,6 +5543,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
             var frameGap = now - lastFrameworkAt;
             lastFrameworkAt = now;
             Volatile.Write(ref localEntityId, objectTable.LocalPlayer?.EntityId ?? 0);
+            ObserveNativeInputContextTransitions();
+            if (frameGap < 0 || frameGap > MaximumFrameGapMilliseconds)
+            {
+                Cancel(CancelReason.Expired, $"Cancelled native input ownership after {frameGap} ms frame gap");
+                return;
+            }
+
             if (Interlocked.Exchange(ref forcedMovementObserved, 0) != 0)
             {
                 Cancel(CancelReason.Knockback, "Cleared by a local-player knockback action effect");
@@ -4675,6 +5565,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             {
                 ReconcileSyntheticMacroExecutorQuarantine(now);
                 ReconcileRetiredPhysicalMacroExecutor(now);
+                ReconcileNativeMacroRepeatTail(now, observedUnlockedBoundary: false);
             }
 
             var observedActionManager = ActionManager.Instance();
@@ -4682,6 +5573,19 @@ internal sealed unsafe class ActionBufferService : IDisposable
             {
                 lock (dispatchGate)
                 {
+                    ResolveLogicalRepeatQueuePending(
+                        observedActionManager,
+                        now,
+                        "at the stable framework boundary",
+                        stableBoundary: true);
+                    if (latestLogicalRepeatQueueReplacementGeneration > 0)
+                    {
+                        TryReplaceLogicalRepeatNativeQueue(
+                            observedActionManager,
+                            latestLogicalRepeatQueueReplacementGeneration,
+                            "at the stable framework boundary after a newer input");
+                    }
+
                     if (latestCertifiedQueueReplacementGeneration > 0)
                     {
                         TryReplaceOwnedNativeQueue(
@@ -4694,6 +5598,9 @@ internal sealed unsafe class ActionBufferService : IDisposable
                         observedActionManager,
                         "at the stable framework boundary after terminal cancellation");
                     ReconcileOwnedNativeQueue(
+                        observedActionManager->LastUsedActionSequence,
+                        CaptureNativeQueue(observedActionManager));
+                    logicalRepeatQueueOwnership.Reconcile(
                         observedActionManager->LastUsedActionSequence,
                         CaptureNativeQueue(observedActionManager));
                     EnforceOwnedNativeQueueSafety(
@@ -4710,6 +5617,8 @@ internal sealed unsafe class ActionBufferService : IDisposable
                     // survive logout/manager teardown. Abandon provenance without
                     // writing native state so it can never cross into a new login.
                     ReconcileOwnedNativeQueue(0, NativeQueueSnapshot.Empty);
+                    logicalRepeatQueueOwnership.Clear();
+                    logicalRepeatQueuePending = null;
                 }
             }
 
@@ -4727,13 +5636,6 @@ internal sealed unsafe class ActionBufferService : IDisposable
             if (engine.Pending is null)
             {
                 pendingRuntimeAction = null;
-                ProcessTurbo(now, frameGap);
-                return;
-            }
-
-            if (frameGap < 0 || frameGap > MaximumFrameGapMilliseconds)
-            {
-                Cancel(CancelReason.Expired, $"Cancelled after {frameGap} ms frame gap");
                 return;
             }
 
@@ -5292,6 +6194,87 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
+    private NativeInputContext CaptureNativeInputContext()
+    {
+        var local = objectTable.LocalPlayer;
+        return new NativeInputContext(
+            clientState.IsLoggedIn,
+            IsBetweenAreas,
+            clientState.TerritoryType,
+            clientState.MapId,
+            clientState.Instance,
+            local?.GameObjectId ?? 0,
+            local?.Address ?? nint.Zero,
+            targetManager.Target?.GameObjectId ?? 0,
+            targetManager.SoftTarget?.GameObjectId ?? 0,
+            local is null || local.IsDead || condition[ConditionFlag.Unconscious],
+            condition[ConditionFlag.Mounted],
+            IsStunned(local),
+            condition[ConditionFlag.BeingMoved]);
+    }
+
+    private void ObserveNativeInputContextTransitions()
+    {
+        var current = CaptureNativeInputContext();
+        var previous = lastNativeInputContext;
+        lastNativeInputContext = current;
+        if (previous is null) return;
+
+        CancelReason reason;
+        string detail;
+        if (previous.LoggedIn && !current.LoggedIn)
+        {
+            reason = CancelReason.Logout;
+            detail = "Native repeat ownership cleared by logout";
+        }
+        else if (!previous.BetweenAreas && current.BetweenAreas
+            || previous.TerritoryId != current.TerritoryId)
+        {
+            reason = CancelReason.TerritoryChange;
+            detail = "Native repeat ownership cleared by territory transition";
+        }
+        else if (previous.MapId != current.MapId
+            || previous.InstanceId != current.InstanceId
+            || previous.LocalGameObjectId != current.LocalGameObjectId
+            || previous.LocalAddress != current.LocalAddress)
+        {
+            reason = CancelReason.InstanceChange;
+            detail = "Native repeat ownership cleared by instance/player transition";
+        }
+        else if (!previous.IsDead && current.IsDead)
+        {
+            reason = CancelReason.Death;
+            detail = "Native repeat ownership cleared by death";
+        }
+        else if (!previous.IsMounted && current.IsMounted)
+        {
+            reason = CancelReason.Mounted;
+            detail = "Native repeat ownership cleared by mounting";
+        }
+        else if (!previous.IsStunned && current.IsStunned)
+        {
+            reason = CancelReason.Stun;
+            detail = "Native repeat ownership cleared by stun";
+        }
+        else if (!previous.IsBeingMoved && current.IsBeingMoved)
+        {
+            reason = CancelReason.Knockback;
+            detail = "Native repeat ownership cleared by forced movement";
+        }
+        else if (previous.HardTargetId != current.HardTargetId
+            || previous.SoftTargetId != current.SoftTargetId)
+        {
+            reason = CancelReason.TargetChange;
+            detail = "Native repeat ownership cleared by target change";
+        }
+        else
+        {
+            return;
+        }
+
+        Cancel(reason, detail);
+    }
+
     private bool IsBetweenAreas =>
         condition[ConditionFlag.BetweenAreas]
         || condition[ConditionFlag.BetweenAreas51];
@@ -5313,6 +6296,18 @@ internal sealed unsafe class ActionBufferService : IDisposable
         activeConflicts = assessment.Conflicts;
         activeIntegrations = assessment.Integrations;
         excludedIntegrationActionIds = assessment.ExcludedActionIds;
+        reActionTurboHotbarsEnabled = assessment.ReActionAudited
+            && assessment.ReActionTurboHotbarsEnabled;
+        reActionTurboHotbarsOutOfCombatEnabled = assessment.ReActionAudited
+            && assessment.ReActionTurboHotbarsOutOfCombatEnabled;
+        reActionMacroQueueEnabled = assessment.ReActionAudited
+            && assessment.ReActionMacroQueueEnabled;
+        reActionLoaded = assessment.ReActionLoaded;
+        reActionAudited = assessment.ReActionAudited;
+        reActionSmartActionTransformActive = assessment.ReActionLoaded
+            && (!assessment.ReActionAudited
+                || assessment.ReActionAutoTargetEnabled
+                || assessment.ReActionActionStacksEnabled);
 
         if (changed)
         {
@@ -5429,8 +6424,35 @@ internal sealed unsafe class ActionBufferService : IDisposable
     {
         lock (dispatchGate)
         {
+            var actionManager = ActionManager.Instance();
+            if (!configuration.DryRun && actionManager != null)
+            {
+                ResolveLogicalRepeatQueuePending(
+                    actionManager,
+                    NowMilliseconds,
+                    "before fault cancellation");
+            }
+
             faulted = true;
             inputGenerations.Invalidate();
+            physicalHotbarInput?.CancelAndRequireRelease();
+            latestLogicalRepeatQueueReplacementGeneration = inputGenerations.Current;
+            if (configuration.DryRun)
+            {
+                AbandonOwnedQueueProvenanceForDetectOnly();
+            }
+            else if (actionManager != null)
+            {
+                TryReplaceLogicalRepeatNativeQueue(
+                    actionManager,
+                    latestLogicalRepeatQueueReplacementGeneration,
+                    "during fault cancellation");
+            }
+            else
+            {
+                logicalRepeatQueueOwnership.Clear();
+                logicalRepeatQueuePending = null;
+            }
             engine.Cancel(CancelReason.Explicit);
             pendingRuntimeAction = null;
             CancelTurboUnsafe(
@@ -5784,22 +6806,20 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
         if (!configuration.Enabled) return "Off - PulseQueue is disabled";
         if (configuration.DryRun) return "Paused - dry run never emits Turbo pulses";
-        if (activeConflicts.Count > 0) return "Suspended - resolve the compatibility conflict";
-        if (syntheticMacroExecutorQuarantine is { } quarantine)
+        var telemetry = physicalHotbarInput.Telemetry;
+        if (telemetry.OwnerLogicalInputId > 0)
         {
-            return $"Quarantining synthetic macro epoch {quarantine.ExecutionEpoch}; suppressed {syntheticMacroSuppressedCallCount} calls";
+            var owner = $"hotbar {telemetry.OwnerHotbarId + 1}, slot {telemetry.OwnerSlotId + 1}";
+            return telemetry.Settings.ExternalRepeatOwnerActive
+                ? $"Holding {owner} - repeats delegated to ReAction"
+                : telemetry.Settings.RepeatEnabled
+                    ? $"Holding {owner} - PulseQueue native repeats active"
+                    : $"Holding {owner} - waiting for combat policy";
         }
 
-        if (Volatile.Read(ref turboAcknowledgement) is not null) return "Holding - waiting for the last exact action acknowledgement";
-        return turboEngine.Snapshot.State switch
-        {
-            HoldRepeatState.Active when macroTurboRuntime is { } runtime =>
-                $"Holding macro hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}",
-            HoldRepeatState.Active when turboRuntime is { } runtime =>
-                $"Holding {(runtime.IsMacro ? "captured macro action from " : string.Empty)}hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}",
-            HoldRepeatState.NeedsRelease => "Ready for a fresh physical key press",
-            _ => "Ready - no held keyboard slot",
-        };
+        return Volatile.Read(ref reActionTurboHotbarsEnabled)
+            ? "Ready - ReAction repeat ownership detected"
+            : "Ready - PulseQueue native repeat ownership available";
     }
 
     private RuntimeState GetRuntimeState()
@@ -5899,6 +6919,98 @@ internal sealed unsafe class ActionBufferService : IDisposable
         ActionRequest ActionRequest,
         double InitialTemporalRemainderMilliseconds,
         long ExpiresAtMilliseconds);
+
+    private sealed record NativeLogicalRepeatExecutionScope(
+        long Generation,
+        long PressId,
+        StandardHotbarBinding Binding,
+        long ObservedAtMilliseconds,
+        NativeQueueSnapshot QueueAtRoot,
+        ushort SequenceAtRoot,
+        bool ReActionMacroQueueAtRoot);
+
+    private sealed record NativeMacroRepeatRootAttempt(
+        NativeLogicalRepeatExecutionScope Execution,
+        long StartedAtMilliseconds,
+        long DiagnosticDeadlineMilliseconds);
+
+    private sealed class NativeMacroRepeatTail(
+        NativeLogicalRepeatExecutionScope execution,
+        long startedAtMilliseconds,
+        long diagnosticDeadlineMilliseconds)
+    {
+        public NativeLogicalRepeatExecutionScope Execution { get; } = execution;
+
+        public long StartedAtMilliseconds { get; } = startedAtMilliseconds;
+
+        public long DiagnosticDeadlineMilliseconds { get; } = diagnosticDeadlineMilliseconds;
+
+        public bool MacroLockObserved { get; set; }
+
+        public bool TimeoutReported { get; set; }
+    }
+
+    private sealed class LogicalRepeatQueueAttempt(
+        NativeLogicalRepeatExecutionScope execution,
+        NativeQueueSnapshot queueBefore,
+        ExactActionTuple expected,
+        ushort sequenceBefore,
+        long startedAtMilliseconds,
+        bool allowDeferredOuterHookCorrelation)
+    {
+        public NativeLogicalRepeatExecutionScope Execution { get; } = execution;
+
+        public NativeQueueSnapshot QueueBefore { get; } = queueBefore;
+
+        public ExactActionTuple Expected { get; } = expected;
+
+        public ushort SequenceBefore { get; } = sequenceBefore;
+
+        public long StartedAtMilliseconds { get; } = startedAtMilliseconds;
+
+        public bool AllowDeferredOuterHookCorrelation { get; } = allowDeferredOuterHookCorrelation;
+
+        public bool SupersededByProvablyDifferentPhysicalInput { get; set; }
+
+        public bool SupersededByTerminalCancellation { get; set; }
+    }
+
+    private sealed class LogicalRepeatQueuePending(
+        NativeLogicalRepeatExecutionScope execution,
+        NativeQueueSnapshot queueBefore,
+        ExactActionTuple expected,
+        ushort sequenceMarker,
+        long expiresAtMilliseconds)
+    {
+        public NativeLogicalRepeatExecutionScope Execution { get; } = execution;
+
+        public NativeQueueSnapshot QueueBefore { get; } = queueBefore;
+
+        public ExactActionTuple Expected { get; } = expected;
+
+        public ushort SequenceMarker { get; } = sequenceMarker;
+
+        public long ExpiresAtMilliseconds { get; } = expiresAtMilliseconds;
+
+        public bool SupersededByProvablyDifferentPhysicalInput { get; set; }
+
+        public bool SupersededByTerminalCancellation { get; set; }
+    }
+
+    private sealed record NativeInputContext(
+        bool LoggedIn,
+        bool BetweenAreas,
+        uint TerritoryId,
+        uint MapId,
+        uint InstanceId,
+        ulong LocalGameObjectId,
+        nint LocalAddress,
+        ulong HardTargetId,
+        ulong SoftTargetId,
+        bool IsDead,
+        bool IsMounted,
+        bool IsStunned,
+        bool IsBeingMoved);
 
     private sealed class HotbarInputScope(
         long generation,

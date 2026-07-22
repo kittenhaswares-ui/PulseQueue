@@ -39,7 +39,7 @@ internal sealed class SettingsWindow : Window
         var diagnostics = actionBuffer.Diagnostics;
 
         ImGui.TextColored(new Vector4(0.42f, 0.84f, 1f, 1f), "PulseQueue");
-        ImGui.TextWrapped("A strict one-shot smart buffer plus optional same-control keyboard Turbo for direct actions and explicitly opted-in action-only macro slots.");
+        ImGui.TextWrapped("A one-shot smart action buffer plus native held-input Turbo for standard hotbars.");
         ImGui.Spacing();
 
         DrawStatus(diagnostics);
@@ -50,8 +50,9 @@ internal sealed class SettingsWindow : Window
         DrawCheckbox("Detailed Dalamud logging", configuration.DetailedLogging, value => configuration.DetailedLogging = value);
 
         ImGui.Separator();
-        ImGui.TextUnformatted("Native Turbo (experimental)");
-        ImGui.TextWrapped("Hold one physical keyboard-bound standard-hotbar control. PulseQueue reruns only that certified slot once per bounded pulse; FFXIV may resolve its current combo/transformed action, which is revalidated before the one native call is allowed.");
+        ImGui.TextUnformatted("Native held-input Turbo (standard hotbars)");
+        ImGui.TextWrapped("While you hold a logical standard-hotbar input, PulseQueue periodically reports that same input as pressed through FFXIV's native binding path. FFXIV resolves the current slot, action, target, combo state, or complete player-authored macro normally.");
+        ImGui.TextWrapped("The newest pressed hotbar input owns Turbo. It immediately replaces an older held input; there is no catch-up burst.");
         if (configuration.Version > PluginConfiguration.CurrentVersion)
         {
             ImGui.TextColored(
@@ -61,7 +62,7 @@ internal sealed class SettingsWindow : Window
         }
         else
         {
-            DrawCheckbox("Enable native Turbo", configuration.TurboEnabled, value => configuration.TurboEnabled = value);
+            DrawCheckbox("Enable native held-input Turbo", configuration.TurboEnabled, value => configuration.TurboEnabled = value);
             DrawSlider(
                 "Initial delay (ms)",
                 configuration.TurboInitialDelayMs,
@@ -79,32 +80,26 @@ internal sealed class SettingsWindow : Window
                 configuration.TurboOutOfCombat,
                 value => configuration.TurboOutOfCombat = value);
             DrawCheckbox(
-                "Enable action-only macro-slot Turbo (separate explicit opt-in)",
+                "Queue actions invoked by macros",
                 configuration.TurboMacrosEnabled,
                 value => configuration.TurboMacrosEnabled = value);
+            ImGui.TextDisabled("Native Turbo repeats the complete held slot, including arbitrary or multi-command macros, regardless of this checkbox. This checkbox controls only the queue mode used by action calls inside macros.");
             if (configuration.TurboMacrosEnabled)
             {
-                ImGui.TextColored(
-                    new Vector4(1f, 0.68f, 0.25f, 1f),
-                    "This is real same-control Macro Turbo: FFXIV reruns the same held macro slot.");
-                ImGui.TextWrapped("Allowed: one or more /ac, /action, /pvpac, or /pvpaction lines plus icon/error metadata. /assist, waits, chat, target, marker, item, gearset, hotbar, and every unknown command fail closed.");
-                ImGui.TextWrapped("PulseQueue never chooses a macro line or target itself. FFXIV executes the unchanged player-authored macro once per bounded pulse, so different action lines may succeed as game state changes.");
-                ImGui.TextWrapped("The static action-line count is a hard maximum per run, not an exact transcript. Each observed line is live-validated; after one line is accepted or queued, every later fallback line in that pulse is stopped before native execution.");
-                ImGui.TextWrapped("Cast-time, ground-target, movement, and MOAction-owned lines remain excluded. Zero locally accepted lines may wait for the next bounded hold pulse; a sent action still requires an exact acknowledgement and is never retried after rejection.");
-                if (!configuration.TurboEnabled)
-                {
-                    ImGui.TextDisabled("Macro Turbo is armed as a preference but remains inactive until native Turbo is also enabled.");
-                }
+                ImGui.TextWrapped("When ReAction Macro Queue is not active, action calls made by macros use FFXIV's normal queue mode. PulseQueue does not parse the macro, choose a line, or change its target.");
+            }
+            else
+            {
+                ImGui.TextDisabled("This setting controls macro action queueing, not whether a held macro slot repeats.");
             }
         }
         ImGui.TextWrapped($"Turbo: {diagnostics.TurboStatus}");
-        ImGui.TextDisabled("Testing scope: exact keyboard chord on standard-hotbar direct Action slots, plus instant non-ground action-only Macro slots with the separate Macro Turbo opt-in. Items, movement, MOAction-owned actions, side-effect macros, mouse, controller, cross-hotbar, and plugin-originated input cannot own Turbo.");
-        ImGui.TextDisabled("Every accepted direct or macro action waits for an exact action-effect acknowledgement. Local unavailability can wait for a later bounded pulse; server rejection ends ownership. Every hold stops after 30 s.");
-        ImGui.TextDisabled("A newer certified direct or certified action-only macro press always preempts an older exact PulseQueue-owned queue, even if the new slot is too early or emits no action call. Foreign or changed queues are never cleared.");
-        ImGui.TextDisabled("ReAction Turbo Hotbars and Macro Queue must be off so there is only one repeat/queue owner. Auto Dismount and Camera Relative Directionals may stay on; their mounted or movement inputs are passed through and never owned. NoClippy may stay on.");
+        ImGui.TextDisabled("Current scope: logical inputs scanned for standard hotbars. Cross-hotbar/controller Turbo is not implemented yet. Directly clicking a slot has no held logical input to repeat.");
+        ImGui.TextDisabled("Held macro slots repeat the entire authored macro through FFXIV. Commands and side effects in that macro can therefore run again; you control its contents.");
+        ImGui.TextDisabled("ReAction Turbo Hotbars may stay on: PulseQueue detects it and delegates repeats instead of creating a second repeat stream. ReAction Macro Queue likewise owns macro queueing when enabled. NoClippy is compatible and may stay on.");
 
         ImGui.Spacing();
-        if (ImGui.Button("Clear pending input and stop Turbo"))
+        if (ImGui.Button("Clear pending smart-buffer input"))
         {
             actionBuffer.Cancel(PulseQueue.Core.CancelReason.Explicit, "Cleared from settings");
         }
@@ -115,19 +110,15 @@ internal sealed class SettingsWindow : Window
         ImGui.Separator();
         ImGui.TextUnformatted("Hard safety contract");
         ImGui.BulletText("Smart buffer: the original player action is sent first; at most that exact tuple can be replayed once.");
-        ImGui.BulletText("Direct Turbo: one held key reruns only its certified hotbar slot; the current same-slot adjusted action is freshly validated for every bounded pulse.");
-        ImGui.BulletText("Macro Turbo: one held key repeats only the same certified macro slot; FFXIV, not PulseQueue, evaluates its action lines.");
-        ImGui.BulletText("Every macro pulse has the authored action-line count as a maximum and may produce at most one accepted native action; later fallback calls are suppressed before Original.");
-        ImGui.BulletText("Each Macro Turbo pulse invokes the slot once with no catch-up burst; PulseQueue never writes targets, lock, recast, or resources.");
-        ImGui.BulletText("A newer hotbar action replaces the old token.");
-        ImGui.BulletText("Any newer certified direct or certified action-only macro root clears one exact older PulseQueue-owned queue before its slot runs, regardless of readiness or whether it emits an action call.");
-        ImGui.BulletText("Ordinary release and a physical original that declines Turbo preserve accepted vanilla queue intent.");
-        ImGui.BulletText("Death, stun, forced movement, target/resolver/context/zone change, frame stall, or another terminal safety event clears every hold and exact-clears owned queue state, including deferred outcomes.");
-        ImGui.BulletText("Mounted state and movement actions are never buffered.");
-        ImGui.BulletText("NoClippy 0.5.0.24 may own animation-lock timing; PulseQueue never writes that lock.");
-        ImGui.BulletText("ReAction 1.3.5.1 requires empty Action Stacks plus Auto Target, Turbo Hotbars, and Macro Queue off. Auto Dismount and Camera Relative Directionals are allowed because their affected inputs are excluded.");
-        ImGui.BulletText("MOAction-targeted skills are passed through normally but excluded from replay.");
-        ImGui.BulletText("Only instant, non-ground-targeted Action/PvPAction hotbar inputs are eligible.");
+        ImGui.BulletText("Turbo changes only FFXIV's answer to 'is this same held logical input pressed?' during its native hotbar scan.");
+        ImGui.BulletText("A genuine new physical press always passes through. Repeat signals from an older continuously held input are suppressed after a newer press wins.");
+        ImGui.BulletText("Each due interval can report one press; missed intervals never produce a catch-up burst.");
+        ImGui.BulletText("FFXIV resolves the binding, slot, adjusted action, target, and macro at the moment of each press.");
+        ImGui.BulletText("A held macro slot reruns the complete unchanged macro. PulseQueue does not whitelist, rewrite, or suppress its commands.");
+        ImGui.BulletText("Macro action queueing changes only the action-call queue mode when ReAction Macro Queue is not already active.");
+        ImGui.BulletText("ReAction can own Turbo or Macro Queue without disabling PulseQueue's separate smart buffer.");
+        ImGui.BulletText("NoClippy may own animation-lock timing; PulseQueue does not write animation lock.");
+        ImGui.BulletText("Turbo currently covers standard hotbar logical inputs, not cross-hotbar/controller input.");
         ImGui.TextWrapped("The one-shot smart-buffer hold window is learned from your own acknowledged action timing, stays between 80 and 180 ms after warm-up, and never decides whether an action is legal.");
 
         ImGui.Separator();
@@ -140,10 +131,12 @@ internal sealed class SettingsWindow : Window
         ImGui.TextUnformatted($"Native queue accepted / blocked: {diagnostics.NativeQueueAccepted} / {diagnostics.NativeQueueBlocked}");
         ImGui.TextUnformatted($"Owned native queues replaced by newer input: {diagnostics.OwnedNativeQueueReplacements}");
         ImGui.TextUnformatted($"Owned native queues exact-cleared by terminal safety: {diagnostics.OwnedNativeQueueSafetyClears}");
+        ImGui.TextUnformatted($"Repeat queues proven / replaced by newer input: {diagnostics.RepeatNativeQueueClaims} / {diagnostics.RepeatNativeQueueReplacements}");
         ImGui.TextUnformatted($"MOAction exclusions observed: {diagnostics.IntegrationExclusions} ({diagnostics.ExcludedIntegrationActions} configured IDs)");
-        ImGui.TextUnformatted($"Turbo starts / pulses / accepted / rejected: {diagnostics.TurboStarts} / {diagnostics.TurboPulses} / {diagnostics.TurboAccepted} / {diagnostics.TurboRejected}");
-        ImGui.TextUnformatted($"Native held repeats suppressed by the active Turbo owner: {diagnostics.TurboSuppressedHeldRepeats}");
-        ImGui.TextUnformatted($"Turbo state / last cancellation: {diagnostics.TurboState} / {diagnostics.TurboLastCancelReason}");
+        ImGui.TextUnformatted($"Native input edges / PulseQueue repeats / ReAction repeats: {diagnostics.TurboPhysicalPresses} / {diagnostics.TurboInjectedRepeats} / {diagnostics.TurboDelegatedRepeats}");
+        ImGui.TextUnformatted($"Newer-input preemptions / releases / older repeats suppressed: {diagnostics.TurboPreemptions} / {diagnostics.TurboReleases} / {diagnostics.TurboSuppressedHeldRepeats}");
+        ImGui.TextUnformatted($"Input-hook fail-open events: {diagnostics.TurboFailedOpenEvents}");
+        ImGui.TextUnformatted($"Turbo state: {diagnostics.TurboState}");
         ImGui.TextUnformatted($"Last cancellation: {diagnostics.LastCancelReason}");
         ImGui.TextWrapped($"Last event: {diagnostics.LastEvent}");
 
