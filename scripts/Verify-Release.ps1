@@ -23,9 +23,20 @@ if ($expectedFingerprint -ne $actualFingerprint) {
     throw 'Published ZIP is stale: source fingerprint changed.'
 }
 
-$repo = @(Get-Content -LiteralPath $repoPath -Raw | ConvertFrom-Json)
-if ($repo.Count -ne 1) { throw 'repo.json must contain exactly one plugin.' }
-$entry = $repo[0]
+$repoDocument = Get-Content -LiteralPath $repoPath -Raw | ConvertFrom-Json
+if ($repoDocument -is [System.Array]) {
+    if ($repoDocument.Length -ne 1) { throw 'repo.json must contain exactly one plugin.' }
+    $entry = $repoDocument[0]
+}
+else {
+    # PowerShell 7 enumerates a one-element JSON array while Windows PowerShell
+    # 5.1 preserves it. Accept both representations, but never more than one
+    # repository entry.
+    $entry = $repoDocument
+}
+if ($null -eq $entry -or $entry.PSObject.Properties['InternalName'] -eq $null) {
+    throw 'repo.json must contain exactly one plugin object.'
+}
 $sourceManifest = Get-Content -LiteralPath $sourceManifestPath -Raw | ConvertFrom-Json
 
 if ($entry.InternalName -ne 'PulseQueue.Plugin') { throw 'Unexpected repo InternalName.' }

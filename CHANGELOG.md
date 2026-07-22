@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.1.0 — 2026-07-22
+
+- Fixes the live Turbo failure shown by the short test: 44 apparent starts
+  produced only one pulse because logical input gaps and typematic callbacks
+  repeatedly replaced the physical hold. Ownership now survives every logical
+  gap until the original raw key is actually released, and owned native held
+  repeats are suppressed instead of restarting the delay.
+- Turbo pulses now invoke exactly one immutable captured action/target tuple
+  for both direct and macro slots. The slot itself is never synthetically rerun,
+  and any adjusted-action/combo transformation ends the hold.
+- Extends the acknowledgement barrier to the original physical send and any
+  one-shot replay. A Turbo pulse cannot overtake an unacknowledged original or
+  buffered action; rejected, ambiguous, or missing acknowledgements end the
+  hold without retry.
+- Adds a second, explicit Macro Turbo opt-in. Schema 3 migrates every older
+  configuration with Macro Turbo off, preserves ordinary Turbo settings from
+  schema 2, and keeps both permissions inert for unknown future schemas.
+- Adds `/pulsequeue turbo macros on|off` and an in-game warning that only a
+  strictly verified single-action macro is eligible. The original macro runs
+  once; Turbo repeats only its exact captured native action and target.
+- Requires ReAction 1.3.5.1 Macro Queue to remain disabled and includes that
+  field in the lightweight live compatibility snapshot guard.
+- Adds exact one-shot native-queue drain authorization, startup release
+  baselining, safe individual macro ID 0 support, strict observed macro-ID
+  decoding, early ActionEffect correlation, and held-repeat diagnostics.
+
 ## 0.3.0.0 — 2026-07-22
 
 - Adds an opt-in native same-slot repeat source for keyboard-bound standard

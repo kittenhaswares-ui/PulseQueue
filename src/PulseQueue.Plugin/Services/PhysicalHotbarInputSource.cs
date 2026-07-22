@@ -58,19 +58,33 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
 
     private readonly Hook<InputData.Delegates.IsInputIdPressed> pressedHook;
     private readonly Action<CertifiedHotbarPress> onCertifiedPress;
+    private readonly Func<CertifiedHotbarPress, bool> shouldSuppressHeldRepeat;
     private readonly object gate = new();
-    private readonly bool[] downLatches = new bool[StandardHotbarBinding.BindingCount];
+    private readonly CertifiedHotbarPress?[] rawHoldOwners = new CertifiedHotbarPress?[StandardHotbarBinding.BindingCount];
+    private readonly bool[] needsRawRelease = new bool[StandardHotbarBinding.BindingCount];
+    // Ownership is keyed by the physical main key, not by its modifier chord.
+    // Changing Ctrl/Alt/Shift while that key remains down must never certify a
+    // second logical binding from the same hardware hold.
+    private readonly Dictionary<SeVirtualKey, long> activePhysicalKeyOwners = new();
     private CertifiedHotbarPress? pendingPress;
     private nint currentInputDataAddress;
     private long lastInputObservationAtMilliseconds;
     private long nextPressId;
+    private long suppressedHeldRepeatCount;
     private bool disposed;
 
     public PhysicalHotbarInputSource(
         IGameInteropProvider interop,
-        Action<CertifiedHotbarPress> onCertifiedPress)
+        Action<CertifiedHotbarPress> onCertifiedPress,
+        Func<CertifiedHotbarPress, bool> shouldSuppressHeldRepeat)
     {
         this.onCertifiedPress = onCertifiedPress ?? throw new ArgumentNullException(nameof(onCertifiedPress));
+        this.shouldSuppressHeldRepeat = shouldSuppressHeldRepeat
+            ?? throw new ArgumentNullException(nameof(shouldSuppressHeldRepeat));
+        // Hook installation has no historical raw-edge information. Every
+        // binding must first be observed fully released before it can certify a
+        // press, even if the first callback happens to be a typematic Pressed.
+        Array.Fill(needsRawRelease, true);
         pressedHook = interop.HookFromAddress<InputData.Delegates.IsInputIdPressed>(
             InputData.MemberFunctionPointers.IsInputIdPressed,
             IsInputIdPressedDetour);
@@ -81,6 +95,8 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
         ObjectDisposedException.ThrowIf(disposed, this);
         pressedHook.Enable();
     }
+
+    public long SuppressedHeldRepeatCount => Interlocked.Read(ref suppressedHeldRepeatCount);
 
     public bool TryConsume(
         RaptureHotbarModule* hotbarModule,
@@ -169,7 +185,9 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
             pendingPress = null;
             currentInputDataAddress = nint.Zero;
             lastInputObservationAtMilliseconds = 0;
-            Array.Clear(downLatches);
+            Array.Clear(rawHoldOwners);
+            Array.Clear(needsRawRelease);
+            activePhysicalKeyOwners.Clear();
         }
 
         pressedHook.Dispose();
@@ -187,29 +205,52 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
 
         var now = NowMilliseconds;
         var index = (int)inputId - (int)InputId.HOTBAR_1_1;
-        var down = inputData->IsInputIdDown(inputId);
         CertifiedHotbarPress? certifiedPress = null;
+        CertifiedHotbarPress? heldRepeat = null;
         lock (gate)
         {
             currentInputDataAddress = (nint)inputData;
             lastInputObservationAtMilliseconds = now;
-            if (!down)
+
+            if (rawHoldOwners[index] is { } existingOwner)
             {
-                downLatches[index] = false;
-                if (pendingPress is { } pending && pending.Binding.InputId == inputId)
+                // Modifier or binding changes may invalidate Turbo liveness, but
+                // they are not a physical key-up. Retain the raw-key latch until
+                // the original hardware key is actually released so the same
+                // hold can never be recertified under a different chord.
+                if (IsPhysicalKeyDown(inputData, existingOwner.PhysicalKey))
                 {
-                    pendingPress = null;
+                    if (pressed) heldRepeat = existingOwner;
+                    goto ObservationComplete;
                 }
 
-                return pressed;
+                rawHoldOwners[index] = null;
+                if (activePhysicalKeyOwners.TryGetValue(existingOwner.PhysicalKey, out var ownerPressId)
+                    && ownerPressId == existingOwner.PressId)
+                {
+                    activePhysicalKeyOwners.Remove(existingOwner.PhysicalKey);
+                }
+                if (pendingPress?.PressId == existingOwner.PressId) pendingPress = null;
             }
 
-            if (downLatches[index]) return pressed;
+            if (needsRawRelease[index])
+            {
+                if (IsAnyBoundKeyboardKeyDown(inputData, inputId))
+                {
+                    goto ObservationComplete;
+                }
 
-            // A down key without a native pressed edge was already down when observation
-            // began. Latch it until release; never manufacture provenance for it.
-            downLatches[index] = true;
-            if (!pressed) return pressed;
+                needsRawRelease[index] = false;
+            }
+
+            if (!pressed)
+            {
+                // The hook may be enabled or reset while a key is already held.
+                // Such a key has no observable raw edge and must remain ineligible
+                // until every keyboard key for this logical binding is released.
+                needsRawRelease[index] = IsAnyBoundKeyboardKeyDown(inputData, inputId);
+                goto ObservationComplete;
+            }
 
             if (!TryFindFreshKeyboardChord(
                     inputData,
@@ -219,7 +260,8 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
                     out var activeModifiers,
                     out var keySettingIndex))
             {
-                return pressed;
+                needsRawRelease[index] = IsAnyBoundKeyboardKeyDown(inputData, inputId);
+                goto ObservationComplete;
             }
 
             var pressId = Interlocked.Increment(ref nextPressId);
@@ -232,8 +274,41 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
                 keySettingIndex,
                 (nint)inputData,
                 now);
+            if (activePhysicalKeyOwners.ContainsKey(physicalKey))
+            {
+                // One held hardware key can drive multiple logical bindings as
+                // modifiers change. Preserve vanilla input, but never manufacture
+                // another Turbo owner until that main key has physically gone up.
+                certifiedPress = null;
+                goto ObservationComplete;
+            }
+
+            rawHoldOwners[index] = certifiedPress;
+            activePhysicalKeyOwners[physicalKey] = pressId;
             pendingPress = certifiedPress;
+
+        ObservationComplete:;
         }
+
+        if (heldRepeat is { } repeated)
+        {
+            try
+            {
+                if (shouldSuppressHeldRepeat(repeated))
+                {
+                    Interlocked.Increment(ref suppressedHeldRepeatCount);
+                    return false;
+                }
+            }
+            catch
+            {
+                // If ownership cannot be queried, vanilla remains authoritative.
+            }
+
+            return pressed;
+        }
+
+        if (certifiedPress is null) return pressed;
 
         try
         {
@@ -254,6 +329,59 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
         }
 
         return pressed;
+    }
+
+    private static bool IsExactChordDown(InputData* inputData, CertifiedHotbarPress press)
+    {
+        if (inputData == null) return false;
+        var keybind = inputData->GetKeybind(press.Binding.InputId);
+        if (keybind == null) return false;
+        var settings = keybind->KeySettings;
+        if (press.KeySettingIndex >= settings.Length) return false;
+        var setting = settings[press.KeySettingIndex];
+        if (setting.Key != press.PhysicalKey
+            || setting.KeyModifier != press.RequiredModifiers
+            || inputData->CurrentKeyModifier != press.ActiveModifiers)
+        {
+            return false;
+        }
+
+        var keyIndex = (int)press.PhysicalKey;
+        var keyStates = inputData->KeyboardInputs.KeyState;
+        return keyIndex >= 0
+            && keyIndex < keyStates.Length
+            && (keyStates[keyIndex] & KeyStateFlags.Down) != 0;
+    }
+
+    private static bool IsPhysicalKeyDown(InputData* inputData, SeVirtualKey physicalKey)
+    {
+        if (inputData == null) return false;
+        var keyIndex = (int)physicalKey;
+        var keyStates = inputData->KeyboardInputs.KeyState;
+        return keyIndex >= 0
+            && keyIndex < keyStates.Length
+            && (keyStates[keyIndex] & KeyStateFlags.Down) != 0;
+    }
+
+    private static bool IsAnyBoundKeyboardKeyDown(InputData* inputData, InputId inputId)
+    {
+        if (inputData == null) return false;
+        var keybind = inputData->GetKeybind(inputId);
+        if (keybind == null) return false;
+        var keyStates = inputData->KeyboardInputs.KeyState;
+        foreach (var setting in keybind->KeySettings)
+        {
+            var keyIndex = (int)setting.Key;
+            if (IsKeyboardKey(setting.Key)
+                && keyIndex >= 0
+                && keyIndex < keyStates.Length
+                && (keyStates[keyIndex] & KeyStateFlags.Down) != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool TryFindFreshKeyboardChord(
@@ -328,4 +456,5 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
     }
 
     private static long NowMilliseconds => Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency;
+
 }

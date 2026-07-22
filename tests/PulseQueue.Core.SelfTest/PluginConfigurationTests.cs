@@ -7,6 +7,7 @@ internal static class PluginConfigurationTests
     {
         yield return ("Turbo configuration defaults are opt-in", DefaultsAreOptIn);
         yield return ("schema 1 migrates to safe Turbo defaults", SchemaOneMigratesSafely);
+        yield return ("schema 2 migrates with Macro Turbo off", SchemaTwoMigratesMacroTurboOff);
         yield return ("Turbo timing is normalized before persistence", TimingNormalizesBeforePersistence);
         yield return ("future configuration fails closed without rewrite", FutureSchemaFailsClosedWithoutRewrite);
         yield return ("explicit reset replaces a future configuration", ResetReplacesFutureSchema);
@@ -17,6 +18,7 @@ internal static class PluginConfigurationTests
         var configuration = new PluginConfiguration();
         Equal(PluginConfiguration.CurrentVersion, configuration.Version);
         False(configuration.TurboEnabled);
+        False(configuration.TurboMacrosEnabled);
         Equal(PluginConfiguration.DefaultTurboInitialDelayMilliseconds, configuration.TurboInitialDelayMs);
         Equal(PluginConfiguration.DefaultTurboRepeatIntervalMilliseconds, configuration.TurboRepeatIntervalMs);
         False(configuration.TurboOutOfCombat);
@@ -38,9 +40,35 @@ internal static class PluginConfigurationTests
 
         Equal(PluginConfiguration.CurrentVersion, configuration.Version);
         False(configuration.TurboEnabled);
+        False(configuration.TurboMacrosEnabled);
         Equal(PluginConfiguration.DefaultTurboInitialDelayMilliseconds, configuration.TurboInitialDelayMs);
         Equal(PluginConfiguration.DefaultTurboRepeatIntervalMilliseconds, configuration.TurboRepeatIntervalMs);
         False(configuration.TurboOutOfCombat);
+        Equal(1, persistence.SaveCount);
+        Same(configuration, persistence.LastSaved);
+    }
+
+    private static void SchemaTwoMigratesMacroTurboOff()
+    {
+        var persistence = new FakePluginInterface();
+        var configuration = new PluginConfiguration
+        {
+            Version = 2,
+            TurboEnabled = true,
+            TurboMacrosEnabled = true,
+            TurboInitialDelayMs = 250,
+            TurboRepeatIntervalMs = 90,
+            TurboOutOfCombat = true,
+        };
+
+        configuration.Initialize(persistence);
+
+        Equal(PluginConfiguration.CurrentVersion, configuration.Version);
+        True(configuration.TurboEnabled);
+        False(configuration.TurboMacrosEnabled);
+        Equal(250, configuration.TurboInitialDelayMs);
+        Equal(90, configuration.TurboRepeatIntervalMs);
+        True(configuration.TurboOutOfCombat);
         Equal(1, persistence.SaveCount);
         Same(configuration, persistence.LastSaved);
     }
@@ -74,6 +102,7 @@ internal static class PluginConfigurationTests
         {
             Version = PluginConfiguration.CurrentVersion + 1,
             TurboEnabled = true,
+            TurboMacrosEnabled = true,
             TurboInitialDelayMs = -50,
             TurboRepeatIntervalMs = 1,
             TurboOutOfCombat = true,
@@ -81,6 +110,7 @@ internal static class PluginConfigurationTests
 
         configuration.Initialize(persistence);
         False(configuration.TurboEnabled);
+        False(configuration.TurboMacrosEnabled);
         Equal(-50, configuration.TurboInitialDelayMs);
         Equal(1, configuration.TurboRepeatIntervalMs);
         True(configuration.TurboOutOfCombat);
@@ -101,6 +131,7 @@ internal static class PluginConfigurationTests
             DryRun = true,
             DetailedLogging = true,
             TurboEnabled = true,
+            TurboMacrosEnabled = true,
             TurboInitialDelayMs = 1_000,
             TurboRepeatIntervalMs = 1_000,
             TurboOutOfCombat = true,
@@ -113,6 +144,7 @@ internal static class PluginConfigurationTests
         False(configuration.DryRun);
         False(configuration.DetailedLogging);
         False(configuration.TurboEnabled);
+        False(configuration.TurboMacrosEnabled);
         Equal(PluginConfiguration.DefaultTurboInitialDelayMilliseconds, configuration.TurboInitialDelayMs);
         Equal(PluginConfiguration.DefaultTurboRepeatIntervalMilliseconds, configuration.TurboRepeatIntervalMs);
         False(configuration.TurboOutOfCombat);

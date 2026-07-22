@@ -16,23 +16,36 @@ call to the original `UseAction` function for a consumed token, and one
 `ActionQueued=false` write when an ownership proof matches the complete queue
 tuple, its unchanged sequence marker, and an older certified hotbar generation.
 A foreign or changed queue can never satisfy that proof. The separate Turbo
-path has one additional bounded operation: one invocation of the exact owned
-hotbar and slot for each current, revalidated pulse token.
+path has one additional bounded operation: one invocation of the exact captured
+native action tuple for each current, revalidated pulse token. It never
+synthetically reruns the hotbar slot.
 
 Native Turbo is a separate, opt-in input source rather than an extension of a
 one-shot token. Its trust boundary begins with a physical keyboard binding to a
 standard hotbar slot. Only a direct `Action` slot with one exactly correlated
-`Action` or `PvPAction` invocation may become a repeat owner. `PvPCombo`,
-macros, items, mouse clicks, controller/cross-hotbar input, and plugin-originated
-slot calls cannot establish that ownership.
+`Action` or `PvPAction` invocation may become a direct repeat owner. A `Macro`
+slot can become an owner only through the second, separately persisted Macro
+Turbo opt-in. `PvPCombo`, items, mouse clicks, controller/cross-hotbar input,
+and plugin-originated slot calls cannot establish ownership.
 
-A Turbo owner stores the exact slot plus its physical key/chord identity. The key may
-produce multiple same-slot invocations while it remains held. Key release or a
+A Macro Turbo candidate must pass a fail-closed static analysis: exactly one
+action command, optional icon/error metadata, and at most one `/assist` before
+the action. Waits, additional actions, state-changing commands, and unknown
+commands are rejected. The physical press runs the macro once so its action can
+be observed. Synthetic pulses then invoke only that immutable native action and
+target tuple; they never replay the macro or its resolver. Configuration
+migration always resets this extra permission to off rather than inferring
+consent from the ordinary Turbo setting.
+
+A Turbo owner stores the exact slot, captured action/target tuple, and physical
+key/chord identity. The key may produce multiple exact-action invocations while
+it remains held, but a changed adjusted action ID terminates ownership. Key release or a
 newer certified physical edge invalidates the owner before that newer slot
 executes. Any newer native hotbar/action invocation also cancels the old owner,
 even when that new input is ineligible to become an owner itself. The older
-slot cannot resume afterward. This is same-slot repetition, not a FIFO, action
-selector, target selector, or special server-rejection retry.
+slot cannot resume afterward. This is exact-action repetition, not a FIFO,
+action selector, target selector, combo transformation, or special
+server-rejection retry.
 
 ## State flow
 
@@ -67,8 +80,9 @@ The initial delay is normalized to 0–1000 ms and the repeat interval to
 60–1000 ms. Defaults are 180 ms and 80 ms respectively. Out-of-combat repeat is
 off by default. Every scheduled invocation must still pass the current safety
 and compatibility gates; a hold is canceled rather than paused across an
-unsafe transition. Holds expire after 30 seconds. A sent pulse also establishes
-an acknowledgement barrier: no later pulse is eligible until a local-player
+unsafe transition. Holds expire after 30 seconds. The original send, any
+one-shot replay, and every Turbo pulse establish an acknowledgement barrier: no
+later pulse is eligible until a local-player
 action effect matches the exact action type, requested/resolved action ID, and
 immediate source sequence. If vanilla creates an exact newly owned native queue
 instead, the same action identity plus a wrap-safe newer local source sequence
@@ -131,10 +145,11 @@ Compatibility is an allowlist, not a best-effort name check:
 
 - NoClippy 0.5.0.24 is supported as the sole animation-lock correction owner.
   PulseQueue does not alter or second-guess its timing writes.
-- ReAction 1.3.5.1 is supported only when Turbo Hotbars, Auto Target, Auto
-  Dismount, and Camera Relative Directionals are off and Action Stacks is empty.
-  Queue adjustments remain native-authoritative except for exact older queue
-  state owned by a certified PulseQueue-observed hotbar generation.
+- ReAction 1.3.5.1 is supported only when Turbo Hotbars, Macro Queue, Auto
+  Target, Auto Dismount, and Camera Relative Directionals are off and Action
+  Stacks is empty. Queue adjustments remain native-authoritative except for
+  exact older queue state owned by a certified PulseQueue-observed hotbar
+  generation.
 - MOAction 4.10.1 is supported through `MOAction.RetargetedActions`. IDs
   reported by that IPC are excluded from capture so MOAction owns their action
   and target transformation end to end.
@@ -145,6 +160,12 @@ provenance marker. PulseQueue therefore fails closed while Turbo is enabled,
 rather than guessing that one action category should outrank another. This
 remains mandatory when PulseQueue native Turbo is enabled: two independent
 repeat sources are never allowed to compete.
+
+ReAction Macro Queue rewrites the action mode used by macro commands. It must
+remain off because that rewrite removes the provenance needed to distinguish an
+exact PulseQueue-owned macro execution from a foreign queued action. The field
+is part of both the periodic compatibility signature and the lightweight live
+ReAction configuration guard.
 
 NoClippy remains the sole animation-lock correction owner for both paths.
 PulseQueue may use the final client lock as a readiness condition but never

@@ -39,7 +39,7 @@ internal sealed class SettingsWindow : Window
         var diagnostics = actionBuffer.Diagnostics;
 
         ImGui.TextColored(new Vector4(0.42f, 0.84f, 1f, 1f), "PulseQueue");
-        ImGui.TextWrapped("A strict smart buffer plus an optional same-slot Turbo source for direct keyboard hotbar actions.");
+        ImGui.TextWrapped("A strict smart buffer plus optional exact-action Turbo sources for direct keyboard hotbar actions and explicitly opted-in macros.");
         ImGui.Spacing();
 
         DrawStatus(diagnostics);
@@ -51,7 +51,7 @@ internal sealed class SettingsWindow : Window
 
         ImGui.Separator();
         ImGui.TextUnformatted("Native Turbo (experimental)");
-        ImGui.TextWrapped("Hold one physical keyboard-bound standard-hotbar action. After the initial delay, PulseQueue invokes only that same slot at the bounded interval while the action is genuinely ready.");
+        ImGui.TextWrapped("Hold one physical keyboard-bound standard-hotbar action. After the initial delay, PulseQueue invokes only the exact captured action and target at the bounded interval while it is genuinely ready; the slot itself is never synthetically rerun.");
         if (configuration.Version > PluginConfiguration.CurrentVersion)
         {
             ImGui.TextColored(
@@ -78,11 +78,27 @@ internal sealed class SettingsWindow : Window
                 "Allow Turbo outside combat",
                 configuration.TurboOutOfCombat,
                 value => configuration.TurboOutOfCombat = value);
+            DrawCheckbox(
+                "Enable safe action-macro Turbo (separate explicit opt-in)",
+                configuration.TurboMacrosEnabled,
+                value => configuration.TurboMacrosEnabled = value);
+            if (configuration.TurboMacrosEnabled)
+            {
+                ImGui.TextColored(
+                    new Vector4(1f, 0.68f, 0.25f, 1f),
+                    "Only strictly verified single-action macros are eligible.");
+                ImGui.TextWrapped("Allowed: one /ac, /action, /pvpac, or /pvpaction line; icon/error metadata; and at most one /assist before the action. Waits, a second action, chat, target, marker, item, gearset, hotbar, and every unknown command fail closed.");
+                ImGui.TextWrapped("The physical press runs the macro once. Turbo then repeats only the exact captured native action and target; it does not replay the macro, /assist, or metadata lines.");
+                if (!configuration.TurboEnabled)
+                {
+                    ImGui.TextDisabled("Macro Turbo is armed as a preference but remains inactive until native Turbo is also enabled.");
+                }
+            }
         }
         ImGui.TextWrapped($"Turbo: {diagnostics.TurboStatus}");
-        ImGui.TextDisabled("Testing scope: exact keyboard chord on direct standard-hotbar Action slots; one instant, non-ground, non-movement Action/PvPAction invocation only. PvPCombo, macros, items, mouse, controller, cross-hotbar, and plugin-originated input cannot own Turbo.");
+        ImGui.TextDisabled("Testing scope: exact keyboard chord on standard-hotbar direct Action slots, plus verified single-action Macro slots only with the separate Macro Turbo opt-in. PvPCombo, arbitrary macros, items, mouse, controller, cross-hotbar, and plugin-originated input cannot own Turbo.");
         ImGui.TextDisabled("Effective cadence also waits for the previous action acknowledgement. Missing acknowledgement stops the hold after 2 s; every hold stops after 30 s.");
-        ImGui.TextDisabled("ReAction Turbo Hotbars must be off. NoClippy may stay on and remains the sole animation-lock owner.");
+        ImGui.TextDisabled("ReAction Turbo Hotbars and Macro Queue must be off. NoClippy may stay on and remains the sole animation-lock owner.");
 
         ImGui.Spacing();
         if (ImGui.Button("Clear pending input and stop Turbo"))
@@ -96,14 +112,15 @@ internal sealed class SettingsWindow : Window
         ImGui.Separator();
         ImGui.TextUnformatted("Hard safety contract");
         ImGui.BulletText("Smart buffer: the original player action is sent first; at most that exact tuple can be replayed once.");
-        ImGui.BulletText("Turbo: one held key may execute multiple actions, but only through its exact owned slot and bounded cadence.");
+        ImGui.BulletText("Turbo: one held key may execute its captured action multiple times, but every pulse is one immutable action/target tuple at a bounded cadence.");
+        ImGui.BulletText("Macro Turbo is separately opted in; the original macro runs once, then only its exact captured action/target may repeat.");
         ImGui.BulletText("No automatic action or target selection, target change, immediate rejection retry, or lock/recast mutation.");
         ImGui.BulletText("A newer hotbar action replaces the old token.");
         ImGui.BulletText("It may clear one exact older native queue entry only when ownership is proven and the newer eligible action is ready or inside the hold window.");
         ImGui.BulletText("Death, stun, forced movement, target/resolver/context/zone change, frame stall, or native queue activity clears it.");
         ImGui.BulletText("Mounted state and movement actions are never buffered.");
         ImGui.BulletText("NoClippy 0.5.0.24 may own animation-lock timing; PulseQueue never writes that lock.");
-        ImGui.BulletText("ReAction 1.3.5.1 requires empty Action Stacks plus Auto Target, Turbo Hotbars, Auto Dismount, and Camera Relative Directionals off.");
+        ImGui.BulletText("ReAction 1.3.5.1 requires empty Action Stacks plus Auto Target, Turbo Hotbars, Macro Queue, Auto Dismount, and Camera Relative Directionals off.");
         ImGui.BulletText("MOAction-targeted skills are passed through normally but excluded from replay.");
         ImGui.BulletText("Only instant, non-ground-targeted Action/PvPAction hotbar inputs are eligible.");
         ImGui.TextWrapped("The hold window is learned from your own acknowledged action timing, stays between 80 and 180 ms after warm-up, and never decides whether an action is legal.");
@@ -119,6 +136,7 @@ internal sealed class SettingsWindow : Window
         ImGui.TextUnformatted($"Owned native queues replaced by newer input: {diagnostics.OwnedNativeQueueReplacements}");
         ImGui.TextUnformatted($"MOAction exclusions observed: {diagnostics.IntegrationExclusions} ({diagnostics.ExcludedIntegrationActions} configured IDs)");
         ImGui.TextUnformatted($"Turbo starts / pulses / accepted / rejected: {diagnostics.TurboStarts} / {diagnostics.TurboPulses} / {diagnostics.TurboAccepted} / {diagnostics.TurboRejected}");
+        ImGui.TextUnformatted($"Native held repeats suppressed by the active Turbo owner: {diagnostics.TurboSuppressedHeldRepeats}");
         ImGui.TextUnformatted($"Turbo state / last cancellation: {diagnostics.TurboState} / {diagnostics.TurboLastCancelReason}");
         ImGui.TextUnformatted($"Last cancellation: {diagnostics.LastCancelReason}");
         ImGui.TextWrapped($"Last event: {diagnostics.LastEvent}");

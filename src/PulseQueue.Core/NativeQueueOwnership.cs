@@ -7,9 +7,19 @@ namespace PulseQueue.Core;
 /// </summary>
 public sealed class NativeQueueOwnership
 {
+    private readonly object gate = new();
     private OwnedQueue? owned;
 
-    public bool HasOwnership => owned is not null;
+    public bool HasOwnership
+    {
+        get
+        {
+            lock (gate)
+            {
+                return owned is not null;
+            }
+        }
+    }
 
     public bool TryClaimNewQueue(
         long generation,
@@ -18,15 +28,18 @@ public sealed class NativeQueueOwnership
         NativeQueueSnapshot after,
         ExactActionTuple attempted)
     {
-        if (generation <= 0
-            || !after.Matches(attempted)
-            || before.Matches(attempted))
+        lock (gate)
         {
-            return false;
-        }
+            if (generation <= 0
+                || !after.Matches(attempted)
+                || before.Matches(attempted))
+            {
+                return false;
+            }
 
-        owned = new OwnedQueue(generation, sequenceMarker, after);
-        return true;
+            owned = new OwnedQueue(generation, sequenceMarker, after, attempted);
+            return true;
+        }
     }
 
     public bool TryTakeForNewerInput(
@@ -35,49 +48,100 @@ public sealed class NativeQueueOwnership
         NativeQueueSnapshot current,
         out NativeQueueSnapshot replaceable)
     {
-        replaceable = default;
-        if (owned is not { } value)
+        lock (gate)
         {
-            return false;
-        }
+            replaceable = default;
+            if (owned is not { } value)
+            {
+                return false;
+            }
 
-        // An outer compatibility hook may hide a queue temporarily and restore
-        // it after an inner action call. Reconcile() clears a stably empty queue
-        // on the framework boundary; replacement preserves ownership meanwhile.
-        if (!current.IsQueued)
-        {
-            return false;
-        }
+            // An outer compatibility hook may hide a queue temporarily and restore
+            // it after an inner action call. Reconcile() clears a stably empty queue
+            // on the framework boundary; replacement preserves ownership meanwhile.
+            if (!current.IsQueued)
+            {
+                return false;
+            }
 
-        if (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker)
-        {
+            if (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker)
+            {
+                owned = null;
+                return false;
+            }
+
+            if (generation <= value.Generation)
+            {
+                return false;
+            }
+
+            replaceable = value.Snapshot;
             owned = null;
-            return false;
+            return true;
         }
+    }
 
-        if (generation <= value.Generation)
+    /// <summary>
+    /// Authorizes one native invocation as the drain of the exact queue entry
+    /// previously claimed by this generation. A successful authorization consumes
+    /// ownership, so the same queue can never authorize a second invocation.
+    /// Stale callers and foreign action tuples leave valid ownership intact; a
+    /// changed queue snapshot or sequence marker invalidates it immediately.
+    /// </summary>
+    public bool TryAuthorizeExactDrain(
+        long generation,
+        uint sequenceMarker,
+        NativeQueueSnapshot current,
+        ExactActionTuple attempted)
+    {
+        lock (gate)
         {
-            return false;
-        }
+            if (owned is not { } value)
+            {
+                return false;
+            }
 
-        replaceable = value.Snapshot;
-        owned = null;
-        return true;
+            if (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker)
+            {
+                owned = null;
+                return false;
+            }
+
+            if (generation != value.Generation
+                || attempted != value.Attempted
+                || !current.Matches(attempted))
+            {
+                return false;
+            }
+
+            owned = null;
+            return true;
+        }
     }
 
     public void Reconcile(uint sequenceMarker, NativeQueueSnapshot current)
     {
-        if (owned is { } value
-            && (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker))
+        lock (gate)
+        {
+            if (owned is { } value
+                && (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker))
+            {
+                owned = null;
+            }
+        }
+    }
+
+    public void Clear()
+    {
+        lock (gate)
         {
             owned = null;
         }
     }
 
-    public void Clear() => owned = null;
-
     private sealed record OwnedQueue(
         long Generation,
         uint SequenceMarker,
-        NativeQueueSnapshot Snapshot);
+        NativeQueueSnapshot Snapshot,
+        ExactActionTuple Attempted);
 }
