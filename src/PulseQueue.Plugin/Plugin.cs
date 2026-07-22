@@ -60,7 +60,7 @@ public sealed class Plugin : IDalamudPlugin
 
         commandManager.AddHandler(Command, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open PulseQueue settings. Subcommands: on, off, status, turbo on|off, turbo macros on|off, dry on|off, log on|off, cancel, reset, help.",
+            HelpMessage = "Open PulseQueue settings. Subcommands: on, off, status, turbo on|off, turbo macros on|off, dry on|off, log on|off, cancel, reset, help. 'turbo macros' controls macro action queueing.",
         });
 
         pluginInterface.UiBuilder.Draw += Draw;
@@ -100,11 +100,11 @@ public sealed class Plugin : IDalamudPlugin
         if (conflicts.Count > 0)
         {
             chatGui.PrintError(
-                $"[PulseQueue] PAUSED by compatibility settings: {string.Join("; ", conflicts)} Open /pulsequeue to see the exact blockers.");
+                $"[PulseQueue] Smart buffer paused by compatibility settings: {string.Join("; ", conflicts)} Native held-input Turbo remains independent. Open /pulsequeue for details.");
         }
         else if (previouslyBlocked)
         {
-            chatGui.Print("[PulseQueue] Compatibility blockers cleared. Smart buffer and enabled Turbo modes are available again.");
+            chatGui.Print("[PulseQueue] Compatibility blockers cleared. The smart buffer is available again; native held-input Turbo remains independently controlled.");
         }
     }
 
@@ -155,12 +155,12 @@ public sealed class Plugin : IDalamudPlugin
                 if (configuration.Version > PluginConfiguration.CurrentVersion)
                 {
                     chatGui.PrintError(
-                        "[PulseQueue] Macro Turbo remains off because this configuration was written by a newer plugin. Update PulseQueue or use Reset only if you intentionally want to replace that newer configuration.");
+                        "[PulseQueue] Macro action queueing remains off because this configuration was written by a newer plugin. Update PulseQueue or use Reset only if you intentionally want to replace that newer configuration.");
                     break;
                 }
 
                 configuration.TurboMacrosEnabled = turboMacros;
-                ApplyConfiguration($"Macro Turbo {(turboMacros ? "enabled" : "disabled")}");
+                ApplyConfiguration($"Macro action queueing {(turboMacros ? "enabled" : "disabled")}");
                 break;
             case "turbo" when TryReadToggle(words, out var turbo):
                 if (configuration.Version > PluginConfiguration.CurrentVersion)
@@ -179,7 +179,7 @@ public sealed class Plugin : IDalamudPlugin
                 break;
             case "cancel":
                 actionBuffer.Cancel(CancelReason.Explicit, "Cancelled by command");
-                chatGui.Print("[PulseQueue] Pending input cleared and Turbo stopped.");
+                chatGui.Print("[PulseQueue] Pending smart-buffer input cleared. Release a held hotbar control to end its native repeat ownership.");
                 break;
             case "reset":
                 ResetConfiguration();
@@ -217,14 +217,14 @@ public sealed class Plugin : IDalamudPlugin
             + $"RTT={value.EstimatedResponseMilliseconds:0} ms/{value.AcceptedTimingSamples} samples; "
             + $"captured={value.Captured}, dispatched={value.Dispatched}, rejected={value.ReplayRejected}; "
             + $"inputs={value.ObservedHotbarInputs}, replaced={value.ReplacedPendingInputs}; "
-            + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} replaced/{value.OwnedNativeQueueSafetyClears} safety-cleared; "
-            + $"turbo={value.TurboState} {value.TurboPulses}/{value.TurboAccepted}/{value.TurboRejected}, suppressed-held={value.TurboSuppressedHeldRepeats}, {value.TurboStatus}, macros={(configuration.TurboMacrosEnabled ? "on" : "off")}; "
+            + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} smart-replaced/{value.OwnedNativeQueueSafetyClears} safety-cleared, repeat={value.RepeatNativeQueueClaims} claimed/{value.RepeatNativeQueueReplacements} replaced; "
+            + $"nativeInput={value.TurboState}, physical/injected/delegated={value.TurboPhysicalPresses}/{value.TurboInjectedRepeats}/{value.TurboDelegatedRepeats}, preempted={value.TurboPreemptions}, suppressed-held={value.TurboSuppressedHeldRepeats}, fail-open={value.TurboFailedOpenEvents}, {value.TurboStatus}, macroQueue={(configuration.TurboMacrosEnabled ? "on" : "off")}; "
             + $"integrations={integrations}; conflicts={conflicts}; last={value.LastEvent}");
     }
 
     private void PrintHelp(bool error = false)
     {
-        const string text = "Usage: /pulsequeue [on|off|status|turbo on|off|turbo macros on|off|dry on|off|log on|off|cancel|reset|help]. /pulsequeue opens settings.";
+        const string text = "Usage: /pulsequeue [on|off|status|turbo on|off|turbo macros on|off|dry on|off|log on|off|cancel|reset|help]. 'turbo macros' toggles macro action queueing; holding a macro repeats the complete slot whenever native Turbo is on. /pulsequeue opens settings.";
         if (error) chatGui.PrintError($"[PulseQueue] {text}");
         else chatGui.Print($"[PulseQueue] {text}");
     }
