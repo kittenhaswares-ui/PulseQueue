@@ -15,7 +15,7 @@ internal static class SelfTests
 
     public static int RunAll()
     {
-        var tests = new (string Name, Action Body)[]
+        var tests = new List<(string Name, Action Body)>
         {
             ("buffer starts idle", BufferStartsIdle),
             ("original attempt awaits outcome", OriginalAttemptAwaitsOutcome),
@@ -70,6 +70,7 @@ internal static class SelfTests
             ("estimator clamp invariant across sample range", EstimatorClampInvariantAcrossRange),
             ("deterministic randomized trace preserves invariants", DeterministicRandomizedTracePreservesInvariants),
         };
+        tests.AddRange(RuntimeCoreTests.All());
 
         var failures = new List<string>();
         foreach (var (name, body) in tests)
@@ -86,7 +87,7 @@ internal static class SelfTests
             }
         }
 
-        Console.WriteLine($"{tests.Length - failures.Count}/{tests.Length} tests passed.");
+        Console.WriteLine($"{tests.Count - failures.Count}/{tests.Count} tests passed.");
         return failures.Count == 0 ? 0 : 1;
     }
 

@@ -18,6 +18,7 @@ public enum CancelReason
     Conflict,
     Logout,
     Death,
+    Mounted,
     Stun,
     Knockback,
     TerritoryChange,
@@ -186,6 +187,11 @@ public sealed class BufferEngine
         if (!safety.IsAlive)
         {
             return CancelReason.Death;
+        }
+
+        if (safety.IsMounted)
+        {
+            return CancelReason.Mounted;
         }
 
         if (safety.IsStunned)

@@ -161,11 +161,14 @@ public sealed class Plugin : IDalamudPlugin
     {
         var value = actionBuffer.Diagnostics;
         var conflicts = value.Conflicts.Count == 0 ? "none" : string.Join(", ", value.Conflicts);
+        var integrations = value.Integrations.Count == 0 ? "none" : string.Join(", ", value.Integrations);
         chatGui.Print(
             $"[PulseQueue] {value.Status}; window={value.HoldWindowMilliseconds} ms; "
             + $"RTT={value.EstimatedResponseMilliseconds:0} ms/{value.AcceptedTimingSamples} samples; "
             + $"captured={value.Captured}, dispatched={value.Dispatched}, rejected={value.ReplayRejected}; "
-            + $"conflicts={conflicts}; last={value.LastEvent}");
+            + $"inputs={value.ObservedHotbarInputs}, replaced={value.ReplacedPendingInputs}; "
+            + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} owned-replaced; "
+            + $"integrations={integrations}; conflicts={conflicts}; last={value.LastEvent}");
     }
 
     private void PrintHelp(bool error = false)
