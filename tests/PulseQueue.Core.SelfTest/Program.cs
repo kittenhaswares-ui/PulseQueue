@@ -73,6 +73,7 @@ internal static class SelfTests
         tests.AddRange(RuntimeCoreTests.All());
         tests.AddRange(HoldRepeatTests.All());
         tests.AddRange(MacroSafetyTests.All());
+        tests.AddRange(MacroTurboTranscriptTests.All());
         tests.AddRange(PhysicalHoldLatchTests.All());
         tests.AddRange(PluginConfigurationTests.All());
 

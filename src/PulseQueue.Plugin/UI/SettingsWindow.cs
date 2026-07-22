@@ -39,7 +39,7 @@ internal sealed class SettingsWindow : Window
         var diagnostics = actionBuffer.Diagnostics;
 
         ImGui.TextColored(new Vector4(0.42f, 0.84f, 1f, 1f), "PulseQueue");
-        ImGui.TextWrapped("A strict smart buffer plus optional exact-action Turbo sources for direct keyboard hotbar actions and explicitly opted-in macros.");
+        ImGui.TextWrapped("A strict smart buffer plus optional keyboard Turbo for exact direct actions and explicitly opted-in action-only macro slots.");
         ImGui.Spacing();
 
         DrawStatus(diagnostics);
@@ -79,16 +79,17 @@ internal sealed class SettingsWindow : Window
                 configuration.TurboOutOfCombat,
                 value => configuration.TurboOutOfCombat = value);
             DrawCheckbox(
-                "Enable safe action-macro Turbo (separate explicit opt-in)",
+                "Enable action-only macro-slot Turbo (separate explicit opt-in)",
                 configuration.TurboMacrosEnabled,
                 value => configuration.TurboMacrosEnabled = value);
             if (configuration.TurboMacrosEnabled)
             {
                 ImGui.TextColored(
                     new Vector4(1f, 0.68f, 0.25f, 1f),
-                    "Only strictly verified single-action macros are eligible.");
-                ImGui.TextWrapped("Allowed: one /ac, /action, /pvpac, or /pvpaction line; icon/error metadata; and at most one /assist before the action. Waits, a second action, chat, target, marker, item, gearset, hotbar, and every unknown command fail closed.");
-                ImGui.TextWrapped("The physical press runs the macro once. Turbo then repeats only the exact captured native action and target; it does not replay the macro, /assist, or metadata lines.");
+                    "This is real same-control Macro Turbo: FFXIV reruns the same held macro slot.");
+                ImGui.TextWrapped("Allowed: one or more /ac, /action, /pvpac, or /pvpaction lines plus icon/error metadata. /assist, waits, chat, target, marker, item, gearset, hotbar, and every unknown command fail closed.");
+                ImGui.TextWrapped("PulseQueue never chooses a macro line or target itself. FFXIV executes the unchanged player-authored macro once per bounded pulse, so different action lines may succeed as game state changes.");
+                ImGui.TextWrapped("Every pulse must reproduce the original action-line count and order. Cast-time, ground-target, movement, and MOAction-owned lines are excluded; a mismatch stops the whole macro run instead of leaking later lines.");
                 if (!configuration.TurboEnabled)
                 {
                     ImGui.TextDisabled("Macro Turbo is armed as a preference but remains inactive until native Turbo is also enabled.");
@@ -96,8 +97,8 @@ internal sealed class SettingsWindow : Window
             }
         }
         ImGui.TextWrapped($"Turbo: {diagnostics.TurboStatus}");
-        ImGui.TextDisabled("Testing scope: exact keyboard chord on standard-hotbar direct Action slots, plus verified single-action Macro slots only with the separate Macro Turbo opt-in. PvPCombo, arbitrary macros, items, mouse, controller, cross-hotbar, and plugin-originated input cannot own Turbo.");
-        ImGui.TextDisabled("Effective cadence also waits for the previous action acknowledgement. Missing acknowledgement stops the hold after 2 s; every hold stops after 30 s.");
+        ImGui.TextDisabled("Testing scope: exact keyboard chord on standard-hotbar direct Action slots, plus instant non-ground action-only Macro slots with the separate Macro Turbo opt-in. Items, movement, MOAction-owned actions, side-effect macros, mouse, controller, cross-hotbar, and plugin-originated input cannot own Turbo.");
+        ImGui.TextDisabled("Direct exact-action pulses wait for acknowledgement. Macro-slot pulses wait for the native macro executor, queue, and animation lock; every hold stops after 30 s.");
         ImGui.TextDisabled("ReAction Turbo Hotbars and Macro Queue must be off. NoClippy may stay on and remains the sole animation-lock owner.");
 
         ImGui.Spacing();
@@ -112,12 +113,13 @@ internal sealed class SettingsWindow : Window
         ImGui.Separator();
         ImGui.TextUnformatted("Hard safety contract");
         ImGui.BulletText("Smart buffer: the original player action is sent first; at most that exact tuple can be replayed once.");
-        ImGui.BulletText("Turbo: one held key may execute its captured action multiple times, but every pulse is one immutable action/target tuple at a bounded cadence.");
-        ImGui.BulletText("Macro Turbo is separately opted in; the original macro runs once, then only its exact captured action/target may repeat.");
-        ImGui.BulletText("No automatic action or target selection, target change, immediate rejection retry, or lock/recast mutation.");
+        ImGui.BulletText("Direct Turbo: one held key may execute its captured immutable action/target tuple multiple times at a bounded cadence.");
+        ImGui.BulletText("Macro Turbo: one held key repeats only the same certified macro slot; FFXIV, not PulseQueue, evaluates its action lines.");
+        ImGui.BulletText("Every macro pulse must match the original ordered action transcript exactly; a mismatch cancels and suppresses its remaining synthetic macro calls.");
+        ImGui.BulletText("Each Macro Turbo pulse invokes the slot once with no catch-up burst; PulseQueue never writes targets, lock, recast, or resources.");
         ImGui.BulletText("A newer hotbar action replaces the old token.");
         ImGui.BulletText("It may clear one exact older native queue entry only when ownership is proven and the newer eligible action is ready or inside the hold window.");
-        ImGui.BulletText("Death, stun, forced movement, target/resolver/context/zone change, frame stall, or native queue activity clears it.");
+        ImGui.BulletText("Death, stun, forced movement, target/resolver/context/zone change, frame stall, or a newer physical press clears every hold.");
         ImGui.BulletText("Mounted state and movement actions are never buffered.");
         ImGui.BulletText("NoClippy 0.5.0.24 may own animation-lock timing; PulseQueue never writes that lock.");
         ImGui.BulletText("ReAction 1.3.5.1 requires empty Action Stacks plus Auto Target, Turbo Hotbars, Macro Queue, Auto Dismount, and Camera Relative Directionals off.");

@@ -10,17 +10,15 @@ public enum MacroSafetyFailure
     UnsupportedCommand,
     WaitDirective,
     MissingAction,
-    MultipleActions,
 }
 
 public readonly record struct SafeActionMacroProfile(
     string ContentFingerprint,
-    string ActionCommand,
-    bool HasOneShotTargetResolver)
+    int ActionCount)
 {
     public bool IsValid =>
         ContentFingerprint.Length == 64
-        && !string.IsNullOrWhiteSpace(ActionCommand);
+        && ActionCount > 0;
 }
 
 public readonly record struct MacroSafetyAnalysis(
@@ -32,10 +30,10 @@ public readonly record struct MacroSafetyAnalysis(
 }
 
 /// <summary>
-/// Accepts only macros from which one exact native action tuple can be captured.
-/// Empty lines and icon/error-display metadata are harmless. One /assist resolver
-/// may precede the action because it runs only on the player's original physical
-/// press; synthetic repeats never replay the macro or its resolver.
+/// Accepts action-only macros from which the runtime can observe one or more native
+/// action attempts. Empty lines and icon/error-display metadata are harmless. Every
+/// other command is rejected so repeating the same physical control cannot replay a
+/// target resolver, chat message, item, hotbar mutation, or other side effect.
 /// </summary>
 public static class MacroSafetyAnalyzer
 {
@@ -60,8 +58,7 @@ public static class MacroSafetyAnalyzer
         ArgumentNullException.ThrowIfNull(lines);
 
         var canonical = new StringBuilder();
-        string? actionLine = null;
-        var hasResolver = false;
+        var actionCount = 0;
         var lineNumber = 0;
         var anyContent = false;
 
@@ -81,20 +78,7 @@ public static class MacroSafetyAnalyzer
             var command = ReadCommand(line);
             if (ActionCommands.Contains(command))
             {
-                if (actionLine is not null)
-                {
-                    return Rejected(canonical, MacroSafetyFailure.MultipleActions, lineNumber);
-                }
-
-                actionLine = line;
-                continue;
-            }
-
-            if (command.Equals("/assist", StringComparison.OrdinalIgnoreCase)
-                && actionLine is null
-                && !hasResolver)
-            {
-                hasResolver = true;
+                actionCount++;
                 continue;
             }
 
@@ -109,14 +93,14 @@ public static class MacroSafetyAnalyzer
             return Rejected(canonical, MacroSafetyFailure.Empty, 0);
         }
 
-        if (actionLine is null)
+        if (actionCount == 0)
         {
             return Rejected(canonical, MacroSafetyFailure.MissingAction, 0);
         }
 
         var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical.ToString())));
         return new MacroSafetyAnalysis(
-            new SafeActionMacroProfile(fingerprint, actionLine, hasResolver),
+            new SafeActionMacroProfile(fingerprint, actionCount),
             MacroSafetyFailure.None,
             0);
     }

@@ -3,11 +3,11 @@
     "Author": "kittenhaswares-ui",
     "Name": "PulseQueue",
     "Punchline": "Latest input wins. Exact action. Responsive timing.",
-    "Description": "A strict smart input buffer with optional keyboard-only exact-action Turbo, newest-input replacement, and fail-closed NoClippy, ReAction, and MOAction compatibility.",
+    "Description": "A strict smart input buffer with exact direct-action Turbo and action-only same-slot Macro Turbo.",
     "InternalName": "PulseQueue.Plugin",
-    "AssemblyVersion": "0.3.1.0",
-    "TestingAssemblyVersion": "0.3.1.0",
-    "Changelog": "Turbo live-test fix: raw-key hold ownership now survives typematic/logical gaps, direct and strictly verified single-action macros share one immutable exact-action path, and original/one-shot/pulse acknowledgement barriers prevent overtaking or retries. Macro Turbo is a separate opt-in; ReAction Turbo Hotbars and Macro Queue must stay off.",
+    "AssemblyVersion": "0.3.2.0",
+    "TestingAssemblyVersion": "0.3.2.0",
+    "Changelog": "Multi-action Macro Turbo fix: the same certified held macro slot now runs once per bounded pulse, while FFXIV chooses the authored action line and target. Ordered action provenance is verified on every run; cast-time, ground-target, movement, MOAction-owned, and side-effect lines fail closed. Newer input wins, and exact direct-action/one-shot behavior remains unchanged. ReAction Turbo Hotbars and Macro Queue must stay off.",
     "RepoUrl": "https://github.com/kittenhaswares-ui/PulseQueue",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
@@ -23,6 +23,6 @@
     "DownloadLinkInstall": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
     "DownloadLinkUpdate": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
     "DownloadLinkTesting": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
-    "LastUpdate": "1784716014"
+    "LastUpdate": "1784722737"
   }
 ]
