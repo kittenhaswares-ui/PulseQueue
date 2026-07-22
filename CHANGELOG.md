@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.3.2.0 — 2026-07-22
+
+- Reworks the separate, default-off Macro Turbo mode around native macro-slot
+  ownership. A pulse now executes the same physically certified keyboard-bound
+  standard-hotbar macro slot once instead of replaying a captured action tuple.
+- Allows action-only macros with one or more `/ac`, `/action`, `/pvpac`, or
+  `/pvpaction` lines plus icon/error metadata. FFXIV evaluates those authored
+  lines and their authored targets in its normal order on every slot execution;
+  PulseQueue does not select a line, fallback action, skill, or target.
+- Freezes the certified physical execution into an exact ordered action
+  transcript whose entry count must equal the statically analyzed
+  `ActionCount`. Duplicate action lines remain duplicate entries; missing,
+  extra, reordered, or semantically changed calls fail closed.
+- Allows a transcript entry's resolved action ID to change only after the same
+  requested action is re-resolved and passes the complete live eligibility
+  checks again. Cast-time, area/ground-target, player-movement, and
+  MOAction-owned actions are excluded from Macro Turbo as well as direct Turbo.
+- Rejects zero-action macros and macros containing `/assist`, waits, chat,
+  target mutation, markers, items, gearsets, hotbar mutation, unknown commands,
+  or any other command outside the action and icon/error allowlist. The original
+  physical press always remains vanilla even when Turbo ownership is rejected.
+- Keeps the one-shot smart buffer and direct-action Turbo contracts exact and
+  unchanged. Multi-action behavior exists only behind the separate Macro Turbo
+  opt-in and only for the one certified macro slot held by the player.
+- Cancels Macro Turbo on raw key-up, any newer certified physical press, macro
+  content or binding change, target/context change, and every existing
+  death/stun/forced-movement/zone/plugin compatibility boundary. A canceled
+  macro owner cannot resume without a fresh physical press.
+- Suppresses an unauthorized action call inside the synthetic macro-slot chain
+  instead of forwarding it to native execution. If a canceled or mismatched
+  synthetic execution continues asynchronously under `MacroLocked`, a bounded
+  quarantine suppresses only its Macro-mode calls until unlock, a newer
+  certified unlocked root macro press, plugin disposal, or the two-second cap;
+  Normal- and Queue-mode calls remain native.
+- Retains the compatibility requirement that ReAction Turbo Hotbars and Macro
+  Queue remain disabled. NoClippy remains the sole animation-lock correction
+  owner.
+- Documents the 0.3.1 live failure that motivated the change: the short test
+  contained 23 macro attempts, but all tested macro slots were multi-action and
+  therefore none could own the former single-action Macro Turbo path.
+- Expands the dependency-free safety suite to 119/119 passing self-tests,
+  including exact-count transcript freeze, duplicate/order preservation,
+  dynamic resolved IDs, incomplete/extra/mismatch failure, and terminal cursor
+  behavior.
+
 ## 0.3.1.0 — 2026-07-22
 
 - Fixes the live Turbo failure shown by the short test: 44 apparent starts

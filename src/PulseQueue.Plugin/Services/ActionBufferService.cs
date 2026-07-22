@@ -95,6 +95,9 @@ internal sealed unsafe class ActionBufferService : IDisposable
     [ThreadStatic]
     private static HotbarInputScope? activeHotbarInput;
 
+    [ThreadStatic]
+    private static MacroPulseExecutionScope? activeMacroPulseExecution;
+
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly IClientState clientState;
     private readonly IObjectTable objectTable;
@@ -129,8 +132,9 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private HoldRepeatEngine turboEngine;
 
     private RuntimeAction? pendingRuntimeAction;
-    private PendingMacroCapture? pendingMacroCapture;
     private TurboRuntime? turboRuntime;
+    private MacroTurboRuntime? macroTurboRuntime;
+    private SyntheticMacroExecutorQuarantine? syntheticMacroExecutorQuarantine;
     private IReadOnlyList<string> activeConflicts = Array.Empty<string>();
     private IReadOnlyList<string> activeIntegrations = Array.Empty<string>();
     private IReadOnlySet<uint> excludedIntegrationActionIds = new HashSet<uint>();
@@ -153,6 +157,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private long turboPulseCount;
     private long turboAcceptedCount;
     private long turboRejectedCount;
+    private long syntheticMacroSuppressedCallCount;
     private long latestCertifiedPressId;
     private TurboAcknowledgement? turboAcknowledgement;
     private uint localEntityId;
@@ -320,7 +325,6 @@ internal sealed unsafe class ActionBufferService : IDisposable
             inputGenerations.Invalidate();
             engine.Cancel(reason);
             pendingRuntimeAction = null;
-            pendingMacroCapture = null;
             recentLocalActionEffects.Clear();
             CancelTurboUnsafe(ToTurboCancelReason(reason), detail);
             lastEvent = detail;
@@ -344,6 +348,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         lock (dispatchGate)
         {
             nativeQueueOwnership.Clear();
+            syntheticMacroExecutorQuarantine = null;
             activeHotbarInput = null;
         }
         useActionHook.Dispose();
@@ -369,6 +374,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 }
 
                 BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
+                PrepareCertifiedMacroInput();
             }
             catch (Exception exception)
             {
@@ -411,6 +417,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
                 var slot = thisPtr == null ? null : thisPtr->GetSlotById(hotbarId, slotId);
                 BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
+                PrepareCertifiedMacroInput();
             }
             catch (Exception exception)
             {
@@ -449,18 +456,41 @@ internal sealed unsafe class ActionBufferService : IDisposable
         bool* outOptAreaTargeted)
     {
         Candidate? candidate = null;
-        Candidate? turboOutcomeCandidate = null;
+        MacroQueueAttempt? macroQueueAttempt = null;
+        var suppressSyntheticMacroCall = false;
         var nativeHotbarInput = hotbarExecutionDepth > 0 && !replaying && !turboDispatching;
         var sequenceBefore = thisPtr == null ? (ushort)0 : thisPtr->LastUsedActionSequence;
 
-        if (!replaying && !turboDispatching)
+        if (mode == ActionManager.UseActionMode.Macro)
         {
             lock (dispatchGate)
             {
-                var capturedPendingMacro = false;
-                if (!nativeHotbarInput)
+                ReconcileSyntheticMacroExecutorQuarantine(NowMilliseconds);
+                suppressSyntheticMacroCall = ShouldSuppressQuarantinedSyntheticMacroCall();
+            }
+        }
+
+        if (!suppressSyntheticMacroCall
+            && turboDispatching
+            && activeMacroPulseExecution is { } pulseExecution)
+        {
+            lock (dispatchGate)
+            {
+                if (mode == ActionManager.UseActionMode.Queue)
                 {
-                    capturedPendingMacro = TryCapturePendingMacroInvocation(
+                    // Queue drains remain native. Consume PulseQueue ownership
+                    // only when the complete exact tuple still authorizes it.
+                    IsOwnedMacroTurboQueueDrain(
+                        thisPtr,
+                        actionType,
+                        actionId,
+                        targetId,
+                        extraParam,
+                        mode,
+                        comboRouteId);
+                }
+                else if (TryAuthorizeMacroPulseInvocation(
+                        pulseExecution,
                         thisPtr,
                         actionType,
                         actionId,
@@ -468,8 +498,80 @@ internal sealed unsafe class ActionBufferService : IDisposable
                         extraParam,
                         mode,
                         comboRouteId,
-                        out turboOutcomeCandidate);
-                    if (!capturedPendingMacro
+                        out var pulseEntry))
+                {
+                    macroQueueAttempt = TryCreateAuthorizedMacroQueueAttempt(
+                        pulseExecution.Runtime.Generation,
+                        pulseExecution.Runtime,
+                        null,
+                        thisPtr,
+                        pulseEntry,
+                        mode,
+                        pulseExecution.Token);
+                }
+                else
+                {
+                    // This call is inside the exact synthetic slot call-chain.
+                    // Once provenance fails it must not escape to native action
+                    // execution, but the already-running physical/original macro
+                    // paths remain untouched.
+                    suppressSyntheticMacroCall = true;
+                }
+            }
+        }
+
+        if (!suppressSyntheticMacroCall && !replaying && !turboDispatching)
+        {
+            lock (dispatchGate)
+            {
+                if (!nativeHotbarInput)
+                {
+                    var ownedMacroQueueDrain = IsOwnedMacroTurboQueueDrain(
+                        thisPtr,
+                        actionType,
+                        actionId,
+                        targetId,
+                        extraParam,
+                        mode,
+                        comboRouteId);
+                    var continuationEntry = default(MacroTurboTranscriptEntry);
+                    var firstInitialEntry = false;
+                    var suppressSyntheticContinuation = false;
+                    var ownedMacroExecution = !ownedMacroQueueDrain
+                        && IsOwnedMacroTurboExecutionContinuation(
+                            thisPtr,
+                            actionType,
+                            actionId,
+                            targetId,
+                            extraParam,
+                            mode,
+                            comboRouteId,
+                            out continuationEntry,
+                            out firstInitialEntry,
+                            out suppressSyntheticContinuation);
+                    suppressSyntheticMacroCall |= suppressSyntheticContinuation;
+                    if (ownedMacroExecution && macroTurboRuntime is { } ownedRuntime)
+                    {
+                        if (firstInitialEntry)
+                        {
+                            TryReplaceOwnedNativeQueue(
+                                thisPtr,
+                                ownedRuntime.Generation,
+                                "before the first certified asynchronous macro action call");
+                        }
+
+                        macroQueueAttempt = TryCreateAuthorizedMacroQueueAttempt(
+                            ownedRuntime.Generation,
+                            ownedRuntime,
+                            null,
+                            thisPtr,
+                            continuationEntry,
+                            mode,
+                            pulseToken: null);
+                    }
+
+                    if (!ownedMacroQueueDrain
+                        && !ownedMacroExecution
                         && !IsOwnedTurboActionContinuation(
                             thisPtr,
                             actionType,
@@ -492,17 +594,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
                             : null;
                         if (macroScope is not null)
                         {
+                            macroScope.MacroLockObservedDuringExecution |= IsMacroExecutionActive();
                             macroScope.ActionInvocationCount++;
-                            if (macroScope.MacroWasLockedBeforeExecution
-                                || macroScope.ActionInvocationCount > 1
-                                || mode != ActionManager.UseActionMode.Macro)
-                            {
-                                macroScope.TurboCandidate = null;
-                                macroScope.TurboDisqualified = true;
-                            }
-                            else
-                            {
-                                var macroCandidate = TryCreateCandidate(
+                            if (TryAuthorizeCertifiedMacroInvocation(
+                                    macroScope,
                                     thisPtr,
                                     actionType,
                                     actionId,
@@ -510,21 +605,34 @@ internal sealed unsafe class ActionBufferService : IDisposable
                                     extraParam,
                                     mode,
                                     comboRouteId,
-                                    ActionManager.UseActionMode.Macro);
-                                if (macroCandidate is null || !IsMacroTargetProven(macroCandidate))
+                                    out var originalEntry,
+                                    out var firstOriginalEntry))
+                            {
+                                if (firstOriginalEntry)
                                 {
-                                    macroScope.TurboDisqualified = true;
+                                    // This is the closest boundary before the first
+                                    // native /ac call. Queue replacement is permitted
+                                    // only after that exact action has passed static
+                                    // eligibility, resolver, and live MOAction checks.
+                                    TryReplaceOwnedNativeQueue(
+                                        thisPtr,
+                                        macroScope.Generation,
+                                        "before the first certified macro action call");
                                 }
-                                else
-                                {
-                                    macroScope.TurboCandidate = macroCandidate;
-                                    turboOutcomeCandidate = macroCandidate;
-                                }
+
+                                macroQueueAttempt = TryCreateAuthorizedMacroQueueAttempt(
+                                    macroScope.Generation,
+                                    null,
+                                    macroScope,
+                                    thisPtr,
+                                    originalEntry,
+                                    mode,
+                                    pulseToken: null);
                             }
 
                             // The physical macro execution stays completely vanilla.
-                            // Its action is provenance only; it never enters one-shot
-                            // buffering or queue replacement.
+                            // Its action calls never enter one-shot buffering and
+                            // PulseQueue never selects a macro line or target.
                             goto CandidateCaptureComplete;
                         }
 
@@ -605,37 +713,55 @@ internal sealed unsafe class ActionBufferService : IDisposable
             }
         }
 
-        // This is deliberately outside plugin-side exception recovery: the native
-        // original is invoked once and only once, and its result/exception is authoritative.
-        var result = useActionHook.Original(
-            thisPtr,
-            actionType,
-            actionId,
-            targetId,
-            extraParam,
-            mode,
-            comboRouteId,
-            outOptAreaTargeted);
+        bool result;
+        if (suppressSyntheticMacroCall)
+        {
+            if (outOptAreaTargeted != null) *outOptAreaTargeted = false;
+            result = false;
+            if (configuration.DetailedLogging)
+            {
+                log.Warning(
+                    "Suppressed unauthorized synthetic Macro Turbo call type={Type}, action={Action}, mode={Mode}; native physical input was not affected.",
+                    actionType,
+                    actionId,
+                    mode);
+            }
+        }
+        else
+        {
+            // This is deliberately outside plugin-side exception recovery: every
+            // authorized or physical native call invokes the original once and its
+            // result/exception remains authoritative.
+            result = useActionHook.Original(
+                thisPtr,
+                actionType,
+                actionId,
+                targetId,
+                extraParam,
+                mode,
+                comboRouteId,
+                outOptAreaTargeted);
+        }
 
         try
         {
             var currentSequence = thisPtr == null ? (ushort)0 : thisPtr->LastUsedActionSequence;
+            if (macroQueueAttempt is { } attemptedMacroQueue)
+            {
+                lock (dispatchGate)
+                {
+                    ProcessMacroQueueAttempt(
+                        thisPtr,
+                        attemptedMacroQueue,
+                        currentSequence);
+                }
+            }
+
             if (candidate is { } captured)
             {
                 lock (dispatchGate)
                 {
                     ProcessOriginalOutcome(thisPtr, captured, result, currentSequence, outOptAreaTargeted);
-                }
-            }
-            else if (turboOutcomeCandidate is { } macroCandidate)
-            {
-                lock (dispatchGate)
-                {
-                    ProcessMacroTurboOriginalOutcome(
-                        thisPtr,
-                        macroCandidate,
-                        result,
-                        currentSequence);
                 }
             }
             else if (currentSequence != 0 && currentSequence != sequenceBefore)
@@ -667,13 +793,54 @@ internal sealed unsafe class ActionBufferService : IDisposable
             slotIdentity)
         {
             MacroWasLockedBeforeExecution = IsMacroExecutionActive(),
+            MacroSnapshotAtPress = slotIdentity is { CommandType: MacroHotbarSlotType }
+                ? CaptureSnapshot(0, 0, includeResolverTargets: true)
+                : null,
         };
+        TryClearSyntheticMacroQuarantineForCertifiedRoot(activeHotbarInput);
         if (configuration.DetailedLogging)
         {
             log.Debug(
                 "Observed hotbar input generation={Generation}, replacedPending={ReplacedPending}.",
                 inputGenerations.Current,
                 replacedPending);
+        }
+    }
+
+    private void PrepareCertifiedMacroInput()
+    {
+        lock (dispatchGate)
+        {
+            if (activeHotbarInput is not { } scope
+                || scope.CertifiedPress is not { } press
+                || scope.SlotIdentity is not { CommandType: MacroHotbarSlotType } slotIdentity
+                || scope.MacroWasLockedBeforeExecution
+                || scope.MacroSnapshotAtPress is not { } snapshot
+                || !configuration.Enabled
+                || !configuration.TurboEnabled
+                || !configuration.TurboMacrosEnabled
+                || configuration.DryRun
+                || activeConflicts.Count > 0
+                || compatibilityQuarantineFrames > 0
+                || (!configuration.TurboOutOfCombat && !condition[ConditionFlag.InCombat])
+                || !inputGenerations.IsCurrent(scope.Generation)
+                || Volatile.Read(ref latestCertifiedPressId) != press.PressId
+                || physicalHotbarInput?.IsStillHeld(press) != true
+                || !TryReadCurrentSlotIdentity(press, out var currentIdentity)
+                || currentIdentity != slotIdentity
+                || !IsSafeSnapshot(snapshot)
+                || !compatibility.IsLiveReActionProfileCurrent()
+                || !TryReadSafeMacroProfile(slotIdentity, out var profile, out _))
+            {
+                return;
+            }
+
+            // Certify the complete macro before its first command can run. This
+            // marker is also required when the hold runtime is created after the
+            // native slot call; a macro that was unsafe at the physical edge can
+            // never become Turbo-eligible retroactively.
+            scope.MacroProfileAtPress = profile;
+            scope.MacroTranscriptBuilder = new MacroTurboTranscriptBuilder(profile.ActionCount);
         }
     }
 
@@ -729,17 +896,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 return true;
             }
 
-            if (pendingMacroCapture?.Press.PressId == press.PressId)
-            {
-                return true;
-            }
-
-            return turboRuntime?.Press.PressId == press.PressId
-                && turboEngine.Snapshot.HasActiveHold;
+            return turboEngine.Snapshot.HasActiveHold
+                && (turboRuntime?.Press.PressId == press.PressId
+                    || macroTurboRuntime?.Press.PressId == press.PressId);
         }
     }
 
-    private bool TryCapturePendingMacroInvocation(
+    private static bool IsMacroTargetProven(Candidate candidate) =>
+        !candidate.IncludeResolverTargets
+        || candidate.TargetId is not (0 or InvalidObjectId);
+
+    private bool TryCreateMacroTranscriptEntry(
         ActionManager* actionManager,
         ActionType actionType,
         uint actionId,
@@ -747,30 +914,205 @@ internal sealed unsafe class ActionBufferService : IDisposable
         uint extraParam,
         ActionManager.UseActionMode mode,
         uint comboRouteId,
-        out Candidate? capturedCandidate)
+        out MacroTurboTranscriptEntry entry)
     {
-        capturedCandidate = null;
-        var pending = pendingMacroCapture;
-        if (pending is null
-            || pending.Disqualified
+        entry = default;
+        if (actionManager == null
             || mode != ActionManager.UseActionMode.Macro
-            || !IsMacroExecutionActive()
-            || NowMilliseconds > pending.ExpiresAtMilliseconds
-            || Volatile.Read(ref latestCertifiedPressId) != pending.Press.PressId
-            || physicalHotbarInput?.IsStillHeld(pending.Press) != true)
+            || actionType is not (ActionType.Action or ActionType.PvPAction)
+            || actionId == 0)
         {
             return false;
         }
 
-        pending.ActionInvocationCount++;
-        if (pending.ActionInvocationCount > 1)
+        var resolvedActionId = actionManager->GetAdjustedActionId(actionId);
+        if (resolvedActionId == 0
+            || excludedIntegrationActionIds.Contains(actionId)
+            || excludedIntegrationActionIds.Contains(resolvedActionId)
+            || !compatibility.IsLiveMOActionUnowned(actionId, resolvedActionId)
+            || !TryGetEligibleActionProfile(
+                actionType,
+                resolvedActionId,
+                targetId,
+                out var includeResolverTargets))
         {
-            pending.Candidate = null;
-            pending.Disqualified = true;
-            return true;
+            return false;
         }
 
-        pending.Candidate = TryCreateCandidate(
+        var snapshot = CaptureSnapshot(targetId, resolvedActionId, includeResolverTargets);
+        if (!IsSafeSnapshot(snapshot)
+            || targetId is not (0 or InvalidObjectId)
+                && targetId != snapshot.LocalGameObjectId
+                && FindTargetAddress(targetId) == nint.Zero)
+        {
+            return false;
+        }
+
+        entry = new MacroTurboTranscriptEntry(
+            (uint)actionType,
+            actionId,
+            resolvedActionId,
+            targetId,
+            extraParam,
+            comboRouteId,
+            includeResolverTargets ? snapshot.TargetFingerprint : 0);
+        return entry.IsValid;
+    }
+
+    private bool TryAuthorizeCertifiedMacroInvocation(
+        HotbarInputScope scope,
+        ActionManager* actionManager,
+        ActionType actionType,
+        uint actionId,
+        ulong targetId,
+        uint extraParam,
+        ActionManager.UseActionMode mode,
+        uint comboRouteId,
+        out MacroTurboTranscriptEntry entry,
+        out bool firstEntry)
+    {
+        entry = default;
+        firstEntry = false;
+        if (scope.MacroProfileAtPress is null
+            || scope.MacroTranscriptBuilder is not { } builder
+            || scope.MacroProvenanceDisqualified)
+        {
+            return false;
+        }
+
+        if (!TryCreateMacroTranscriptEntry(
+                actionManager,
+                actionType,
+                actionId,
+                targetId,
+                extraParam,
+                mode,
+                comboRouteId,
+                out entry))
+        {
+            scope.MacroProvenanceDisqualified = true;
+            scope.MacroProvenanceFailure = "original macro emitted an ineligible, non-Macro-mode, or MOAction-owned action";
+            return false;
+        }
+
+        firstEntry = builder.ObservedActionCount == 0;
+        var appendResult = builder.Append(entry);
+        if (appendResult == MacroTurboBuildStepResult.Appended) return true;
+
+        scope.MacroProvenanceDisqualified = true;
+        scope.MacroProvenanceFailure = $"original macro transcript append failed ({appendResult})";
+        firstEntry = false;
+        return false;
+    }
+
+    private bool TryAuthorizeRuntimeMacroInvocation(
+        MacroTurboRuntime runtime,
+        ActionManager* actionManager,
+        ActionType actionType,
+        uint actionId,
+        ulong targetId,
+        uint extraParam,
+        ActionManager.UseActionMode mode,
+        uint comboRouteId,
+        out MacroTurboTranscriptEntry entry,
+        out bool firstInitialEntry)
+    {
+        entry = default;
+        firstInitialEntry = false;
+        if (!TryCreateMacroTranscriptEntry(
+                actionManager,
+                actionType,
+                actionId,
+                targetId,
+                extraParam,
+                mode,
+                comboRouteId,
+                out entry))
+        {
+            if (runtime.Transcript is not null)
+            {
+                QuarantineSyntheticMacroExecutor(
+                    runtime,
+                    "ineligible, non-Macro-mode, or MOAction-owned action call");
+            }
+
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.PluginChange,
+                "Macro Turbo observed an ineligible, non-Macro-mode, or MOAction-owned action call");
+            return false;
+        }
+
+        if (runtime.Transcript is null)
+        {
+            if (runtime.InitialTranscriptBuilder is not { } builder
+                || runtime.InitialMacroLockCompleted)
+            {
+                CancelTurboUnsafe(
+                    HoldRepeatCancelReason.Fault,
+                    "Macro Turbo initial transcript owner was missing");
+                return false;
+            }
+
+            firstInitialEntry = builder.ObservedActionCount == 0;
+            var appendResult = builder.Append(entry);
+            if (appendResult == MacroTurboBuildStepResult.Appended) return true;
+
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.ResolvedActionChange,
+                $"Macro Turbo initial transcript append failed ({appendResult})");
+            firstInitialEntry = false;
+            return false;
+        }
+
+        if (runtime.ActiveExecutionCursor is not { } cursor
+            || runtime.ActiveExecutionEpoch <= 0)
+        {
+            QuarantineSyntheticMacroExecutor(runtime, "missing ordered execution cursor");
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.Fault,
+                "Macro Turbo action call had no active ordered execution epoch");
+            return false;
+        }
+
+        var acceptResult = cursor.Accept(entry);
+        if (acceptResult == MacroTurboExecutionAcceptResult.Accepted) return true;
+
+        QuarantineSyntheticMacroExecutor(runtime, $"ordered transcript mismatch ({acceptResult})");
+        CancelTurboUnsafe(
+            HoldRepeatCancelReason.ResolvedActionChange,
+            $"Macro Turbo ordered transcript mismatch ({acceptResult})");
+        return false;
+    }
+
+    private bool TryAuthorizeMacroPulseInvocation(
+        MacroPulseExecutionScope pulseExecution,
+        ActionManager* actionManager,
+        ActionType actionType,
+        uint actionId,
+        ulong targetId,
+        uint extraParam,
+        ActionManager.UseActionMode mode,
+        uint comboRouteId,
+        out MacroTurboTranscriptEntry entry)
+    {
+        entry = default;
+        var runtime = pulseExecution.Runtime;
+        if (!ReferenceEquals(macroTurboRuntime, runtime)
+            || !turboEngine.IsTokenCurrent(pulseExecution.Token)
+            || runtime.ActiveExecutionEpoch != pulseExecution.ExecutionEpoch
+            || runtime.Transcript is null)
+        {
+            QuarantineSyntheticMacroExecutor(
+                runtime,
+                "stale synchronous call-chain provenance");
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.Fault,
+                "Macro Turbo synchronous call-chain provenance was stale");
+            return false;
+        }
+
+        return TryAuthorizeRuntimeMacroInvocation(
+            runtime,
             actionManager,
             actionType,
             actionId,
@@ -778,19 +1120,271 @@ internal sealed unsafe class ActionBufferService : IDisposable
             extraParam,
             mode,
             comboRouteId,
-            ActionManager.UseActionMode.Macro);
-        if (pending.Candidate is null || !IsMacroTargetProven(pending.Candidate))
+            out entry,
+            out _);
+    }
+
+    private MacroQueueAttempt? TryCreateAuthorizedMacroQueueAttempt(
+        long generation,
+        MacroTurboRuntime? runtime,
+        HotbarInputScope? inputScope,
+        ActionManager* actionManager,
+        MacroTurboTranscriptEntry entry,
+        ActionManager.UseActionMode mode,
+        HoldRepeatPulseToken? pulseToken)
+    {
+        if (actionManager == null
+            || generation <= 0
+            || !inputGenerations.IsCurrent(generation)
+            || mode != ActionManager.UseActionMode.Macro
+            || !entry.IsValid)
         {
-            pending.Candidate = null;
-            pending.Disqualified = true;
+            return null;
         }
-        capturedCandidate = pending.Candidate;
+
+        if (runtime is not null)
+        {
+            if (!ReferenceEquals(macroTurboRuntime, runtime)
+                || !turboEngine.Snapshot.HasActiveHold
+                || Volatile.Read(ref latestCertifiedPressId) != runtime.Press.PressId
+                || physicalHotbarInput?.IsStillHeld(runtime.Press) != true)
+            {
+                return null;
+            }
+
+            if (pulseToken is { } token)
+            {
+                if (!turboEngine.IsTokenCurrent(token)
+                    || activeMacroPulseExecution is not { } pulseExecution
+                    || !ReferenceEquals(pulseExecution.Runtime, runtime)
+                    || pulseExecution.Token != token
+                    || pulseExecution.ExecutionEpoch != runtime.ActiveExecutionEpoch)
+                {
+                    return null;
+                }
+            }
+            else if (!runtime.OwnsMacroExecutor || !IsMacroExecutionActive())
+            {
+                return null;
+            }
+        }
+        else if (inputScope is null
+            || !ReferenceEquals(activeHotbarInput, inputScope)
+            || inputScope.MacroProfileAtPress is null)
+        {
+            return null;
+        }
+
+        return new MacroQueueAttempt(
+            generation,
+            runtime,
+            inputScope,
+            new ExactActionTuple(
+                entry.ActionType,
+                entry.RequestedActionId,
+                entry.ResolvedActionId,
+                entry.TargetId,
+                entry.ExtraParam,
+                (uint)mode,
+                entry.RouteId),
+            CaptureNativeQueue(actionManager),
+            actionManager->LastUsedActionSequence);
+    }
+
+    private void ProcessMacroQueueAttempt(
+        ActionManager* actionManager,
+        MacroQueueAttempt attempt,
+        ushort currentSequence)
+    {
+        if (actionManager == null || !inputGenerations.IsCurrent(attempt.Generation)) return;
+        if (attempt.Runtime is { } runtime)
+        {
+            if (!ReferenceEquals(macroTurboRuntime, runtime)) return;
+        }
+        else if (attempt.InputScope is not { } inputScope
+            || !ReferenceEquals(activeHotbarInput, inputScope)
+            || inputScope.MacroProfileAtPress is null)
+        {
+            return;
+        }
+
+        var queueAfter = CaptureNativeQueue(actionManager);
+        nativeQueueOwnership.Reconcile(currentSequence, queueAfter);
+        var queueTuple = attempt.Attempted with
+        {
+            // QueueType is stored native state and is independent of the
+            // UseAction mode that created it. Ownership always records the
+            // exact value currently present in the queue.
+            Mode = queueAfter.Mode,
+        };
+        var claimed = currentSequence == attempt.SequenceBefore
+            && queueAfter.Matches(queueTuple)
+            && !attempt.QueueBefore.Matches(queueTuple)
+            && nativeQueueOwnership.TryClaimNewQueue(
+                attempt.Generation,
+                currentSequence,
+                attempt.QueueBefore,
+                queueAfter,
+                queueTuple);
+        if (claimed)
+        {
+            if (attempt.Runtime is { } owningRuntime)
+            {
+                owningRuntime.OwnedQueueTuple = queueTuple;
+            }
+            else if (attempt.InputScope is { } owningScope)
+            {
+                owningScope.OwnedMacroQueueTuple = queueTuple;
+            }
+
+            if (configuration.DetailedLogging)
+            {
+                log.Debug(
+                    "Macro Turbo claimed exact native queue generation={Generation}, action={Action}, mode={Mode}.",
+                    attempt.Generation,
+                    queueAfter.ActionId,
+                    queueAfter.Mode);
+            }
+
+            return;
+        }
+
+        if (attempt.Runtime is { OwnedQueueTuple: { } runtimeTuple }
+            && !queueAfter.Matches(runtimeTuple))
+        {
+            attempt.Runtime.OwnedQueueTuple = null;
+        }
+        else if (attempt.InputScope is { OwnedMacroQueueTuple: { } scopeTuple }
+            && !queueAfter.Matches(scopeTuple))
+        {
+            attempt.InputScope.OwnedMacroQueueTuple = null;
+        }
+    }
+
+    private bool IsOwnedMacroTurboQueueDrain(
+        ActionManager* actionManager,
+        ActionType actionType,
+        uint actionId,
+        ulong targetId,
+        uint extraParam,
+        ActionManager.UseActionMode mode,
+        uint comboRouteId)
+    {
+        var runtime = macroTurboRuntime;
+        if (runtime is null
+            || actionManager == null
+            || mode != ActionManager.UseActionMode.Queue
+            || runtime.OwnedQueueTuple is not { } ownedTuple
+            || !turboEngine.Snapshot.HasActiveHold
+            || !inputGenerations.IsCurrent(runtime.Generation)
+            || Volatile.Read(ref latestCertifiedPressId) != runtime.Press.PressId
+            || physicalHotbarInput?.IsStillHeld(runtime.Press) != true
+            || actionType != (ActionType)ownedTuple.ActionType
+            || actionId == 0
+            || actionId != ownedTuple.RequestedActionId && actionId != ownedTuple.ResolvedActionId
+            || targetId != ownedTuple.TargetId
+            || extraParam != ownedTuple.Param
+            || comboRouteId != ownedTuple.RouteId
+            || excludedIntegrationActionIds.Contains(ownedTuple.RequestedActionId)
+            || excludedIntegrationActionIds.Contains(ownedTuple.ResolvedActionId)
+            || !compatibility.IsLiveMOActionUnowned(
+                ownedTuple.RequestedActionId,
+                ownedTuple.ResolvedActionId)
+            || !IsTurboSafetySafe(ObserveMacroTurbo(runtime, checkMacroHash: true).Safety))
+        {
+            return false;
+        }
+
+        var currentQueue = CaptureNativeQueue(actionManager);
+        if (!nativeQueueOwnership.TryAuthorizeExactDrain(
+                runtime.Generation,
+                actionManager->LastUsedActionSequence,
+                currentQueue,
+                ownedTuple))
+        {
+            return false;
+        }
+
+        runtime.OwnedQueueTuple = null;
+        if (configuration.DetailedLogging)
+        {
+            log.Debug(
+                "Macro Turbo authorized exact native queue drain generation={Generation}, action={Action}.",
+                runtime.Generation,
+                actionId);
+        }
+
         return true;
     }
 
-    private static bool IsMacroTargetProven(Candidate candidate) =>
-        !candidate.IncludeResolverTargets
-        || candidate.TargetId is not (0 or InvalidObjectId);
+    private bool IsOwnedMacroTurboExecutionContinuation(
+        ActionManager* actionManager,
+        ActionType actionType,
+        uint actionId,
+        ulong targetId,
+        uint extraParam,
+        ActionManager.UseActionMode mode,
+        uint comboRouteId,
+        out MacroTurboTranscriptEntry entry,
+        out bool firstInitialEntry,
+        out bool suppressCurrentCall)
+    {
+        entry = default;
+        firstInitialEntry = false;
+        suppressCurrentCall = false;
+        var runtime = macroTurboRuntime;
+        var macroLocked = IsMacroExecutionActive();
+        var bindingMatches = runtime is not null
+            && TryReadCurrentSlotIdentity(runtime.Press, out var currentIdentity)
+            && currentIdentity == runtime.SlotIdentity;
+        var ownedExecutorContext = runtime is not null
+            && runtime.OwnsMacroExecutor
+            && macroLocked
+            && turboEngine.Snapshot.HasActiveHold
+            && inputGenerations.IsCurrent(runtime.Generation)
+            && Volatile.Read(ref latestCertifiedPressId) == runtime.Press.PressId
+            && physicalHotbarInput?.IsStillHeld(runtime.Press) == true
+            && bindingMatches;
+        if (runtime is not null
+            && runtime.OwnsMacroExecutor
+            && macroLocked
+            && runtime.Transcript is not null
+            && runtime.ActiveExecutionCursor is not null
+            && runtime.ActiveExecutionEpoch > 0)
+        {
+            suppressCurrentCall = true;
+        }
+
+        if (runtime is null
+            || !ownedExecutorContext
+            || mode != ActionManager.UseActionMode.Macro
+            || !IsTurboSafetySafe(ObserveMacroTurbo(runtime, checkMacroHash: true).Safety))
+        {
+            if (runtime is not null && suppressCurrentCall)
+            {
+                QuarantineSyntheticMacroExecutor(
+                    runtime,
+                    "frozen asynchronous executor continuation failed safety or mode validation");
+            }
+
+            return false;
+        }
+
+        runtime.InitialMacroLockObserved = true;
+        var authorized = TryAuthorizeRuntimeMacroInvocation(
+            runtime,
+            actionManager,
+            actionType,
+            actionId,
+            targetId,
+            extraParam,
+            mode,
+            comboRouteId,
+            out entry,
+            out firstInitialEntry);
+        if (authorized) suppressCurrentCall = false;
+        return authorized;
+    }
 
     private bool IsOwnedTurboActionContinuation(
         ActionManager* actionManager,
@@ -842,6 +1436,104 @@ internal sealed unsafe class ActionBufferService : IDisposable
     {
         var shell = RaptureShellModule.Instance();
         return shell != null && shell->MacroLocked;
+    }
+
+    private void QuarantineSyntheticMacroExecutor(
+        MacroTurboRuntime runtime,
+        string reason)
+    {
+        if (runtime.Transcript is null || runtime.ActiveExecutionEpoch <= 0) return;
+        var now = NowMilliseconds;
+        var existing = syntheticMacroExecutorQuarantine;
+        if (existing is null
+            || existing.Generation != runtime.Generation
+            || existing.ExecutionEpoch != runtime.ActiveExecutionEpoch)
+        {
+            syntheticMacroExecutorQuarantine = new SyntheticMacroExecutorQuarantine(
+                runtime.Generation,
+                runtime.Press.PressId,
+                runtime.ActiveExecutionEpoch,
+                now,
+                SaturatingAdd(now, MaximumMacroCaptureMilliseconds));
+        }
+
+        lastEvent = $"Synthetic Macro executor quarantined: {reason}";
+        if (configuration.DetailedLogging)
+        {
+            log.Warning(
+                "Synthetic Macro Turbo executor quarantined generation={Generation}, epoch={Epoch}, reason={Reason}.",
+                runtime.Generation,
+                runtime.ActiveExecutionEpoch,
+                reason);
+        }
+    }
+
+    private bool ShouldSuppressQuarantinedSyntheticMacroCall()
+    {
+        if (syntheticMacroExecutorQuarantine is not { } quarantine
+            || !IsMacroExecutionActive())
+        {
+            return false;
+        }
+
+        syntheticMacroSuppressedCallCount++;
+        lastEvent = $"Suppressed quarantined synthetic Macro call #{syntheticMacroSuppressedCallCount}";
+        if (configuration.DetailedLogging)
+        {
+            log.Warning(
+                "Suppressed quarantined synthetic Macro call generation={Generation}, epoch={Epoch}, total={Total}.",
+                quarantine.Generation,
+                quarantine.ExecutionEpoch,
+                syntheticMacroSuppressedCallCount);
+        }
+
+        return true;
+    }
+
+    private void ReconcileSyntheticMacroExecutorQuarantine(long now)
+    {
+        var quarantine = syntheticMacroExecutorQuarantine;
+        if (quarantine is null) return;
+        if (IsMacroExecutionActive()
+            && now >= 0
+            && now <= quarantine.ExpiresAtMilliseconds)
+        {
+            return;
+        }
+
+        syntheticMacroExecutorQuarantine = null;
+        if (configuration.DetailedLogging)
+        {
+            log.Information(
+                "Synthetic Macro executor quarantine cleared generation={Generation}, epoch={Epoch}, reason={Reason}.",
+                quarantine.Generation,
+                quarantine.ExecutionEpoch,
+                IsMacroExecutionActive() ? "bounded timeout" : "native MacroLocked observed false");
+        }
+    }
+
+    private void TryClearSyntheticMacroQuarantineForCertifiedRoot(HotbarInputScope scope)
+    {
+        var quarantine = syntheticMacroExecutorQuarantine;
+        if (quarantine is null
+            || scope.CertifiedPress is not { } press
+            || scope.SlotIdentity is not { CommandType: MacroHotbarSlotType }
+            || scope.MacroWasLockedBeforeExecution
+            || IsMacroExecutionActive()
+            || scope.Generation <= quarantine.Generation
+            || press.PressId <= quarantine.PressId)
+        {
+            return;
+        }
+
+        syntheticMacroExecutorQuarantine = null;
+        if (configuration.DetailedLogging)
+        {
+            log.Information(
+                "Synthetic Macro executor quarantine cleared by newer certified root Macro press={PressId}, generation={Generation}.",
+                press.PressId,
+                scope.Generation);
+        }
     }
 
     private void CompleteHotbarInput()
@@ -935,67 +1627,161 @@ internal sealed unsafe class ActionBufferService : IDisposable
             return;
         }
 
-        if (!TryReadSafeMacroProfile(slotIdentity, out var profile, out var failure))
+        if (scope.MacroProfileAtPress is not { } certifiedProfile)
         {
-            LogTurboStartRejected(slotIdentity, $"macro profile rejected ({failure})");
+            LogTurboStartRejected(slotIdentity, "macro was not certified before native slot execution");
             return;
         }
 
-        if (scope.TurboDisqualified || scope.ActionInvocationCount > 1)
+        if (scope.MacroProvenanceDisqualified
+            || scope.MacroTranscriptBuilder is null)
         {
-            LogTurboStartRejected(slotIdentity, "macro produced multiple or ineligible action calls");
-            return;
-        }
-
-        var macroExecutionActive = IsMacroExecutionActive();
-        if (scope.TurboCandidate is null && !macroExecutionActive)
-        {
-            LogTurboStartRejected(slotIdentity, "macro produced no synchronous action and did not enter the native macro executor");
-            return;
-        }
-
-        if (macroExecutionActive)
-        {
-            pendingMacroCapture = new PendingMacroCapture(
-                press,
+            LogTurboStartRejected(
                 slotIdentity,
-                profile,
-                scope.Generation,
-                SaturatingAdd(NowMilliseconds, MaximumMacroCaptureMilliseconds))
-            {
-                Candidate = scope.TurboCandidate,
-                ActionInvocationCount = scope.ActionInvocationCount,
-                Disqualified = scope.TurboDisqualified,
-                InitialAcknowledgement = scope.InitialAcknowledgement,
-            };
-            lastEvent = $"Waiting for macro hotbar {slotIdentity.Binding.HotbarId + 1}, slot {slotIdentity.Binding.SlotId + 1} to finish exact action capture";
-            if (configuration.DetailedLogging)
-            {
-                log.Information(
-                    "Turbo macro capture pending press={PressId}, hotbar={Hotbar}, slot={Slot}, command={Command}, actions={Actions}.",
-                    press.PressId,
-                    slotIdentity.Binding.HotbarId + 1,
-                    slotIdentity.Binding.SlotId + 1,
-                    slotIdentity.CommandId,
-                    scope.ActionInvocationCount);
-            }
-
+                scope.MacroProvenanceFailure ?? "macro action provenance was unavailable");
             return;
         }
 
-        if (scope.TurboCandidate is not { } capturedMacroAction)
+        if (!TryReadSafeMacroProfile(slotIdentity, out var profile, out var failure)
+            || profile.ContentFingerprint != certifiedProfile.ContentFingerprint)
         {
-            LogTurboStartRejected(slotIdentity, "macro action capture was unavailable after execution");
+            LogTurboStartRejected(slotIdentity, $"macro profile rejected or changed ({failure})");
             return;
         }
 
-        StartTurboRuntime(
+        if (scope.MacroSnapshotAtPress is not { } macroSnapshot
+            || !IsSafeSnapshot(macroSnapshot))
+        {
+            LogTurboStartRejected(slotIdentity, "macro context was unavailable or unsafe at the certified press");
+            return;
+        }
+
+        StartMacroTurboRuntime(
             scope,
             press,
             slotIdentity,
-            capturedMacroAction,
             profile,
+            macroSnapshot,
             inputSource);
+    }
+
+    private void StartMacroTurboRuntime(
+        HotbarInputScope scope,
+        CertifiedHotbarPress press,
+        HotbarSlotIdentity slotIdentity,
+        SafeActionMacroProfile macroProfile,
+        Snapshot macroSnapshot,
+        PhysicalHotbarInputSource inputSource)
+    {
+        var currentSnapshot = CaptureSnapshot(0, 0, includeResolverTargets: true);
+        if (candidateIdentityChanged())
+        {
+            LogTurboStartRejected(slotIdentity, "macro binding, content, context, or compatibility changed during execution");
+            return;
+        }
+
+        var macroLocked = IsMacroExecutionActive();
+        var initialBuilder = scope.MacroTranscriptBuilder;
+        MacroTurboTranscript? transcript = null;
+        if (initialBuilder is null)
+        {
+            LogTurboStartRejected(slotIdentity, "macro transcript builder was unavailable");
+            return;
+        }
+
+        if (!macroLocked)
+        {
+            var freezeResult = initialBuilder.Freeze(out transcript);
+            if (freezeResult != MacroTurboFreezeResult.Frozen || transcript is null)
+            {
+                LogTurboStartRejected(
+                    slotIdentity,
+                    $"synchronous macro transcript was not complete ({freezeResult})");
+                return;
+            }
+        }
+
+        var options = CreateTurboOptions();
+        if (turboEngine.Options != options)
+        {
+            CancelTurboUnsafe(HoldRepeatCancelReason.PluginChange, "Turbo timing changed");
+            turboEngine = new HoldRepeatEngine(options);
+        }
+
+        if (turboEngine.Snapshot.State == HoldRepeatState.NeedsRelease)
+        {
+            turboEngine.ObserveRelease();
+        }
+
+        var intentFingerprint = NonZeroFingerprint(
+            slotIdentity.CommandType,
+            slotIdentity.CommandId,
+            macroSnapshot.TargetFingerprint,
+            macroSnapshot.ContextFingerprint,
+            Convert.ToUInt64(macroProfile.ContentFingerprint[..16], 16));
+        var request = new HoldRepeatStartRequest(
+            press.PressId,
+            scope.Generation,
+            slotIdentity.ControlFingerprint,
+            intentFingerprint,
+            IsCertifiedFreshPress: true);
+        var result = turboEngine.TryStart(request, NowMilliseconds);
+        if (result is not (HoldRepeatStartResult.Started or HoldRepeatStartResult.Replaced))
+        {
+            return;
+        }
+
+        turboRuntime = null;
+        Interlocked.Exchange(ref turboAcknowledgement, null);
+        macroTurboRuntime = new MacroTurboRuntime(
+            press,
+            slotIdentity,
+            macroProfile,
+            macroSnapshot,
+            compatibilitySignature,
+            scope.Generation,
+            request,
+            SaturatingAdd(NowMilliseconds, MaximumMacroCaptureMilliseconds),
+            macroLocked ? initialBuilder : null,
+            transcript)
+        {
+            InitialMacroLockObserved = scope.MacroLockObservedDuringExecution || macroLocked,
+            // Returning from the certified native slot while unlocked is itself
+            // a completion barrier for instant/synchronous macros. We never wait
+            // for or adopt an unrelated future MacroLocked state.
+            InitialMacroLockCompleted = !macroLocked,
+            OwnsMacroExecutor = macroLocked,
+            OwnedQueueTuple = scope.OwnedMacroQueueTuple,
+        };
+        turboStartCount++;
+        lastEvent = $"Macro Turbo owns hotbar {slotIdentity.Binding.HotbarId + 1}, slot {slotIdentity.Binding.SlotId + 1}";
+        if (configuration.DetailedLogging)
+        {
+            log.Information(
+                "Turbo macro start press={PressId}, generation={Generation}, hotbar={Hotbar}, slot={Slot}, actions={Actions}, initialLockObserved={LockObserved}, initialLockActive={LockActive}, result={Result}.",
+                press.PressId,
+                scope.Generation,
+                slotIdentity.Binding.HotbarId + 1,
+                slotIdentity.Binding.SlotId + 1,
+                macroProfile.ActionCount,
+                scope.MacroLockObservedDuringExecution || macroLocked,
+                macroLocked,
+                result);
+        }
+
+        return;
+
+        bool candidateIdentityChanged() =>
+            !inputGenerations.IsCurrent(scope.Generation)
+            || !inputSource.IsStillHeld(press)
+            || Volatile.Read(ref latestCertifiedPressId) != press.PressId
+            || !TryReadCurrentSlotIdentity(press, out var currentIdentity)
+            || currentIdentity != slotIdentity
+            || !TryReadSafeMacroProfile(slotIdentity, out var currentMacro, out _)
+            || currentMacro.ContentFingerprint != macroProfile.ContentFingerprint
+            || !macroSnapshot.Equals(currentSnapshot)
+            || !IsSafeSnapshot(currentSnapshot)
+            || !compatibility.IsLiveReActionProfileCurrent();
     }
 
     private void StartTurboRuntime(
@@ -1090,6 +1876,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             macroProfile,
             compatibilitySignature,
             request);
+        macroTurboRuntime = null;
         turboRuntime = runtime;
         if (scope.InitialAcknowledgement is { } initialAcknowledgement
             && !BeginInitialTurboAcknowledgement(runtime, initialAcknowledgement))
@@ -1141,6 +1928,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             if (!snapshot.HasActiveHold)
             {
                 turboRuntime = null;
+                macroTurboRuntime = null;
                 Interlocked.Exchange(ref turboAcknowledgement, null);
                 return;
             }
@@ -1150,6 +1938,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 CancelTurboUnsafe(
                     HoldRepeatCancelReason.InputLost,
                     $"Turbo cancelled after {frameGap} ms frame gap");
+                return;
+            }
+
+            if (macroTurboRuntime is { } macroRuntime)
+            {
+                ProcessMacroTurboUnsafe(macroRuntime, snapshot, now);
                 return;
             }
 
@@ -1170,7 +1964,8 @@ internal sealed unsafe class ActionBufferService : IDisposable
             {
                 CancelTurboUnsafe(
                     decision.CancelReason,
-                    $"Turbo cancelled: {decision.CancelReason}");
+                    $"Turbo cancelled: {decision.CancelReason}",
+                    logTerminatedHold: true);
                 return;
             }
 
@@ -1200,6 +1995,332 @@ internal sealed unsafe class ActionBufferService : IDisposable
             if (decision.Kind != HoldRepeatDecisionKind.Pulse) return;
             DispatchTurboPulse(runtime, decision.Pulse);
         }
+    }
+
+    private void ProcessMacroTurboUnsafe(
+        MacroTurboRuntime runtime,
+        HoldRepeatSnapshot snapshot,
+        long now)
+    {
+        if (!ReferenceEquals(macroTurboRuntime, runtime))
+        {
+            CancelTurboUnsafe(HoldRepeatCancelReason.Fault, "Macro Turbo runtime token mismatch");
+            return;
+        }
+
+        var macroLocked = IsMacroExecutionActive();
+        if (macroLocked)
+        {
+            if (!runtime.OwnsMacroExecutor)
+            {
+                CancelTurboUnsafe(
+                    HoldRepeatCancelReason.PluginChange,
+                    "Macro Turbo observed a foreign native macro executor owner");
+                return;
+            }
+
+            runtime.InitialMacroLockObserved = true;
+        }
+        else if (runtime.OwnsMacroExecutor)
+        {
+            runtime.OwnsMacroExecutor = false;
+            if (runtime.Transcript is null)
+            {
+                if (!TryFreezeInitialMacroTranscript(runtime)) return;
+            }
+            else if (runtime.ActiveExecutionCursor is not null
+                && !TryCompleteMacroExecutionEpoch(
+                    runtime,
+                    runtime.ActiveExecutionEpoch,
+                    "asynchronous native macro completion"))
+            {
+                return;
+            }
+        }
+
+        if (!runtime.InitialMacroLockCompleted
+            && (runtime.InitialMacroLockDeadlineMilliseconds <= 0
+                || now < 0
+                || now > runtime.InitialMacroLockDeadlineMilliseconds))
+        {
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.InputLost,
+                "Macro Turbo never observed the initial native macro lock complete");
+            return;
+        }
+
+        var due = now >= snapshot.NextPulseAtMilliseconds;
+        var observation = ObserveMacroTurbo(runtime, checkMacroHash: due);
+        var decision = turboEngine.Tick(now, observation.Safety, observation.ActionReady);
+        if (decision.Kind == HoldRepeatDecisionKind.Cancelled)
+        {
+            CancelTurboUnsafe(
+                decision.CancelReason,
+                $"Macro Turbo cancelled: {decision.CancelReason}",
+                logTerminatedHold: true);
+            return;
+        }
+
+        if (decision.Kind == HoldRepeatDecisionKind.Pulse)
+        {
+            DispatchMacroTurboPulse(runtime, decision.Pulse);
+        }
+    }
+
+    private bool TryFreezeInitialMacroTranscript(MacroTurboRuntime runtime)
+    {
+        if (runtime.InitialTranscriptBuilder is not { } builder)
+        {
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.Fault,
+                "Macro Turbo initial transcript builder disappeared before native MacroLock ended");
+            return false;
+        }
+
+        var freezeResult = builder.Freeze(out var transcript);
+        runtime.InitialTranscriptBuilder = null;
+        if (freezeResult != MacroTurboFreezeResult.Frozen || transcript is null)
+        {
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.ResolvedActionChange,
+                $"Macro Turbo initial ordered transcript was incomplete ({freezeResult})");
+            return false;
+        }
+
+        runtime.Transcript = transcript;
+        runtime.InitialMacroLockCompleted = true;
+        return true;
+    }
+
+    private bool TryCompleteMacroExecutionEpoch(
+        MacroTurboRuntime runtime,
+        long epoch,
+        string phase)
+    {
+        if (epoch <= 0
+            || runtime.ActiveExecutionEpoch != epoch
+            || runtime.ActiveExecutionCursor is not { } cursor)
+        {
+            CancelTurboUnsafe(
+                HoldRepeatCancelReason.Fault,
+                $"Macro Turbo ordered execution epoch was missing at {phase}");
+            return false;
+        }
+
+        var completion = cursor.Finish();
+        runtime.ActiveExecutionCursor = null;
+        runtime.ActiveExecutionEpoch = 0;
+        if (completion == MacroTurboExecutionResult.Complete) return true;
+
+        CancelTurboUnsafe(
+            HoldRepeatCancelReason.ResolvedActionChange,
+            $"Macro Turbo ordered execution transcript ended {completion} at {phase}");
+        return false;
+    }
+
+    private void DispatchMacroTurboPulse(
+        MacroTurboRuntime runtime,
+        HoldRepeatPulseToken token)
+    {
+        lock (dispatchGate)
+        {
+            if (!turboEngine.IsTokenCurrent(token)
+                || !ReferenceEquals(macroTurboRuntime, runtime)
+                || activeMacroPulseExecution is not null
+                || engine.Pending is not null)
+            {
+                return;
+            }
+
+            var observation = ObserveMacroTurbo(runtime, checkMacroHash: true);
+            if (!IsTurboSafetySafe(observation.Safety))
+            {
+                CancelTurboUnsafe(
+                    GetTurboCancellationReason(observation.Safety),
+                    "Macro Turbo final safety check failed");
+                return;
+            }
+
+            if (!observation.ActionReady
+                || observation.HotbarModule == null
+                || runtime.Transcript is not { } transcript)
+            {
+                return;
+            }
+
+            if (runtime.NextExecutionEpoch == long.MaxValue)
+            {
+                CancelTurboUnsafe(
+                    HoldRepeatCancelReason.Fault,
+                    "Macro Turbo ordered execution epoch was exhausted");
+                return;
+            }
+
+            byte result;
+            var executionEpoch = ++runtime.NextExecutionEpoch;
+            runtime.ActiveExecutionEpoch = executionEpoch;
+            runtime.ActiveExecutionCursor = transcript.StartExecution();
+            activeMacroPulseExecution = new MacroPulseExecutionScope(runtime, token, executionEpoch);
+            runtime.OwnsMacroExecutor = true;
+            turboDispatching = true;
+            hotbarExecutionDepth++;
+            try
+            {
+                // Same-control Macro Turbo intentionally repeats the certified
+                // native slot. The macro executor and FFXIV select the first
+                // executable action line; PulseQueue never selects an action or
+                // target from the macro itself.
+                result = executeSlotByIdHook.Original(
+                    observation.HotbarModule,
+                    runtime.SlotIdentity.Binding.HotbarId,
+                    runtime.SlotIdentity.Binding.SlotId);
+            }
+            finally
+            {
+                hotbarExecutionDepth--;
+                turboDispatching = false;
+                activeMacroPulseExecution = null;
+                runtime.OwnsMacroExecutor = ReferenceEquals(macroTurboRuntime, runtime)
+                    && IsMacroExecutionActive();
+                if (ReferenceEquals(macroTurboRuntime, runtime)
+                    && !runtime.OwnsMacroExecutor)
+                {
+                    TryCompleteMacroExecutionEpoch(
+                        runtime,
+                        executionEpoch,
+                        "synchronous slot return");
+                }
+            }
+
+            turboPulseCount++;
+            if (!ReferenceEquals(macroTurboRuntime, runtime)) return;
+            if (result != 0)
+            {
+                turboAcceptedCount++;
+            }
+            else
+            {
+                // A rejected macro slot is not retried immediately. The physical
+                // hold may authorize the next independently rate-limited pulse.
+                turboRejectedCount++;
+            }
+
+            lastEvent = $"Macro Turbo pulsed hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}";
+            if (configuration.DetailedLogging)
+            {
+                log.Information(
+                    "Turbo macro pulse ordinal={Ordinal}, hotbar={Hotbar}, slot={Slot}, result={Result}, macroLocked={MacroLocked}.",
+                    token.Ordinal,
+                    runtime.SlotIdentity.Binding.HotbarId + 1,
+                    runtime.SlotIdentity.Binding.SlotId + 1,
+                    result,
+                    IsMacroExecutionActive());
+            }
+        }
+    }
+
+    private MacroTurboObservation ObserveMacroTurbo(
+        MacroTurboRuntime runtime,
+        bool checkMacroHash)
+    {
+        var inputSource = physicalHotbarInput;
+        var stableInputContext = !disposed
+            && clientState.IsLoggedIn
+            && !IsBetweenAreas
+            && clientState.TerritoryType == runtime.Snapshot.TerritoryId;
+        var physicalControlDown = stableInputContext
+            && inputSource?.IsStillHeld(runtime.Press) == true;
+        var macroProfileMatches = !checkMacroHash
+            || TryReadSafeMacroProfile(runtime.SlotIdentity, out var currentMacroProfile, out _)
+                && currentMacroProfile.ContentFingerprint == runtime.MacroProfile.ContentFingerprint;
+        var actionManager = ActionManager.Instance();
+        var transcriptMatches = runtime.Transcript is null
+            ? !runtime.InitialMacroLockCompleted
+            : !checkMacroHash
+                || actionManager != null && IsFrozenMacroTranscriptLive(runtime.Transcript, actionManager);
+        var bindingMatches = Volatile.Read(ref latestCertifiedPressId) == runtime.Press.PressId
+            && TryReadCurrentSlotIdentity(runtime.Press, out var currentIdentity)
+            && currentIdentity == runtime.SlotIdentity;
+        var currentSnapshot = stableInputContext
+            ? CaptureSnapshot(0, 0, includeResolverTargets: true)
+            : null;
+        var targetMatches = currentSnapshot is { } targetSnapshot
+            && targetSnapshot.TargetFingerprint == runtime.Snapshot.TargetFingerprint;
+        var territoryMatches = currentSnapshot is { } territorySnapshot
+            && territorySnapshot.TerritoryId == runtime.Snapshot.TerritoryId;
+        var instanceMatches = currentSnapshot is { } instanceSnapshot
+            && instanceSnapshot.ContextFingerprint == runtime.Snapshot.ContextFingerprint
+            && instanceSnapshot.LocalGameObjectId == runtime.Snapshot.LocalGameObjectId
+            && instanceSnapshot.LocalAddress == runtime.Snapshot.LocalAddress;
+        var pluginStateMatches = string.Equals(
+                compatibilitySignature,
+                runtime.CompatibilitySignature,
+                StringComparison.Ordinal)
+            && compatibility.IsLiveReActionProfileCurrent();
+        var local = objectTable.LocalPlayer;
+        var knockbackActive = condition[ConditionFlag.BeingMoved]
+            || Volatile.Read(ref forcedMovementObserved) != 0;
+        var turboEnabled = configuration.Enabled
+            && configuration.TurboEnabled
+            && configuration.TurboMacrosEnabled
+            && !configuration.DryRun
+            && (configuration.TurboOutOfCombat || condition[ConditionFlag.InCombat]);
+        var safety = new HoldRepeatSafetyState(
+            Enabled: turboEnabled && !disposed,
+            ConflictDetected: activeConflicts.Count > 0 || compatibilityQuarantineFrames > 0,
+            LoggedIn: clientState.IsLoggedIn && local is not null && !IsBetweenAreas,
+            IsAlive: local is { IsDead: false } && !condition[ConditionFlag.Unconscious],
+            IsMounted: condition[ConditionFlag.Mounted],
+            IsStunned: IsStunned(local),
+            IsKnockbackActive: knockbackActive,
+            PhysicalControlDown: physicalControlDown,
+            ReleaseObserved: !physicalControlDown,
+            TerritoryMatches: territoryMatches,
+            InstanceMatches: instanceMatches,
+            TargetMatches: targetMatches,
+            ResolvedActionMatches: macroProfileMatches && transcriptMatches,
+            BindingMatches: bindingMatches,
+            PluginStateMatches: pluginStateMatches,
+            Faulted: faulted);
+        var hotbarModule = bindingMatches ? RaptureHotbarModule.Instance() : null;
+        var actionReady = IsTurboSafetySafe(safety)
+            && runtime.InitialMacroLockCompleted
+            && runtime.Transcript is not null
+            && runtime.ActiveExecutionCursor is null
+            && runtime.ActiveExecutionEpoch == 0
+            && engine.Pending is null
+            && actionManager != null
+            && hotbarModule != null
+            && !IsMacroExecutionActive()
+            && !actionManager->ActionQueued
+            && actionManager->AnimationLock <= AnimationLockEpsilonSeconds;
+        return new MacroTurboObservation(hotbarModule, safety, actionReady);
+    }
+
+    private bool IsFrozenMacroTranscriptLive(
+        MacroTurboTranscript transcript,
+        ActionManager* actionManager)
+    {
+        if (actionManager == null || transcript.Count != transcript.ExpectedActionCount) return false;
+        for (var index = 0; index < transcript.Count; index++)
+        {
+            var expected = transcript[index];
+            if (!TryCreateMacroTranscriptEntry(
+                    actionManager,
+                    (ActionType)expected.ActionType,
+                    expected.RequestedActionId,
+                    expected.TargetId,
+                    expected.ExtraParam,
+                    ActionManager.UseActionMode.Macro,
+                    expected.RouteId,
+                    out var observed)
+                || !expected.SemanticallyMatches(observed))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void DispatchTurboPulse(TurboRuntime runtime, HoldRepeatPulseToken token)
@@ -1889,49 +3010,6 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
-    private void ProcessMacroTurboOriginalOutcome(
-        ActionManager* actionManager,
-        Candidate candidate,
-        bool originalResult,
-        ushort currentSequence)
-    {
-        var sequenceAdvanced = currentSequence != candidate.SequenceAtCapture;
-        if (sequenceAdvanced)
-        {
-            RecordSentSequence(currentSequence, NowMilliseconds);
-        }
-
-        if (actionManager == null)
-        {
-            MarkTurboCaptureDisqualified(candidate);
-            return;
-        }
-
-        var queueAfter = CaptureNativeQueue(actionManager);
-        var nativeOutcome = NativeActionOutcomeClassifier.Classify(
-            originalResult || sequenceAdvanced,
-            candidate.QueueAtCapture,
-            queueAfter,
-            candidate.ExactTuple);
-        RecordInitialTurboOutcome(
-            candidate,
-            nativeOutcome,
-            sequenceAdvanced,
-            currentSequence,
-            exactQueueClaimed: false,
-            allowQueuedOutcome: false);
-        if (configuration.DetailedLogging)
-        {
-            log.Debug(
-                "Macro Turbo original outcome generation={Generation}, action={Action}, outcome={Outcome}, sequenceAdvanced={SequenceAdvanced}, queueAfter={Queued}.",
-                candidate.InputGeneration,
-                candidate.ResolvedActionId,
-                nativeOutcome,
-                sequenceAdvanced,
-                queueAfter.IsQueued);
-        }
-    }
-
     private void RecordInitialTurboOutcome(
         Candidate candidate,
         NativeActionOutcome outcome,
@@ -1990,17 +3068,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             scope.TurboDisqualified |= disqualified;
         }
 
-        if (pendingMacroCapture is { } pending
-            && pending.Generation == candidate.InputGeneration
-            && pending.Candidate?.ExactTuple == candidate.ExactTuple)
-        {
-            pending.InitialAcknowledgement = seed;
-            pending.Disqualified |= disqualified;
-        }
     }
-
-    private void MarkTurboCaptureDisqualified(Candidate candidate) =>
-        ApplyTurboCaptureOutcome(candidate, seed: null, disqualified: true);
 
     private void OnActivePluginsChanged(IActivePluginsChangedEventArgs _)
     {
@@ -2056,7 +3124,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
             lock (dispatchGate)
             {
-                TryCompletePendingMacroCapture(now);
+                ReconcileSyntheticMacroExecutorQuarantine(now);
             }
 
             var observedActionManager = ActionManager.Instance();
@@ -2184,60 +3252,6 @@ internal sealed unsafe class ActionBufferService : IDisposable
         catch (Exception exception)
         {
             Fault(exception, "Framework validation failed");
-        }
-    }
-
-    private void TryCompletePendingMacroCapture(long now)
-    {
-        var pending = pendingMacroCapture;
-        if (pending is null) return;
-
-        if (now < 0
-            || now > pending.ExpiresAtMilliseconds
-            || pending.Disqualified
-            || !configuration.Enabled
-            || !configuration.TurboEnabled
-            || !configuration.TurboMacrosEnabled
-            || configuration.DryRun
-            || !inputGenerations.IsCurrent(pending.Generation)
-            || Volatile.Read(ref latestCertifiedPressId) != pending.Press.PressId
-            || physicalHotbarInput?.IsStillHeld(pending.Press) != true)
-        {
-            pendingMacroCapture = null;
-            LogTurboStartRejected(pending.SlotIdentity, "macro capture expired, changed, or was released");
-            return;
-        }
-
-        if (IsMacroExecutionActive()) return;
-
-        if (pending.ActionInvocationCount != 1 || pending.Candidate is not { } candidate)
-        {
-            pendingMacroCapture = null;
-            LogTurboStartRejected(
-                pending.SlotIdentity,
-                $"macro produced {pending.ActionInvocationCount} eligible action calls; exactly one is required");
-            return;
-        }
-
-        var scope = new HotbarInputScope(
-            pending.Generation,
-            pending.Press,
-            pending.SlotIdentity)
-        {
-            ActionInvocationCount = 1,
-            TurboCandidate = candidate,
-            InitialAcknowledgement = pending.InitialAcknowledgement,
-        };
-        pendingMacroCapture = null;
-        if (physicalHotbarInput is { } inputSource)
-        {
-            StartTurboRuntime(
-                scope,
-                pending.Press,
-                pending.SlotIdentity,
-                candidate,
-                pending.Profile,
-                inputSource);
         }
     }
 
@@ -2842,12 +3856,31 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
-    private void CancelTurboUnsafe(HoldRepeatCancelReason reason, string detail)
+    private void CancelTurboUnsafe(
+        HoldRepeatCancelReason reason,
+        string detail,
+        bool logTerminatedHold = false)
     {
         if (reason == HoldRepeatCancelReason.None) reason = HoldRepeatCancelReason.InputLost;
-        var hadActiveHold = turboEngine.Snapshot.HasActiveHold;
+        if (macroTurboRuntime is { } macroRuntime
+            && macroRuntime.Transcript is not null
+            && macroRuntime.ActiveExecutionCursor is not null
+            && macroRuntime.ActiveExecutionEpoch > 0
+            && macroRuntime.OwnsMacroExecutor
+            && IsMacroExecutionActive())
+        {
+            // Cancellation removes the runtime owner immediately, but the native
+            // macro executor may still emit later lines. Preserve only the small
+            // frozen-epoch tombstone needed to suppress those Macro-mode calls.
+            QuarantineSyntheticMacroExecutor(
+                macroRuntime,
+                $"runtime cancelled during active frozen executor ({reason})");
+        }
+
+        var hadActiveHold = logTerminatedHold || turboEngine.Snapshot.HasActiveHold;
         turboEngine.Cancel(reason);
         turboRuntime = null;
+        macroTurboRuntime = null;
         Interlocked.Exchange(ref turboAcknowledgement, null);
         turboLastCancelReason = reason;
         lastEvent = detail;
@@ -3028,14 +4061,16 @@ internal sealed unsafe class ActionBufferService : IDisposable
         if (!configuration.Enabled) return "Off - PulseQueue is disabled";
         if (configuration.DryRun) return "Paused - dry run never emits Turbo pulses";
         if (activeConflicts.Count > 0) return "Suspended - resolve the compatibility conflict";
-        if (pendingMacroCapture is { } pending)
+        if (syntheticMacroExecutorQuarantine is { } quarantine)
         {
-            return $"Capturing macro hotbar {pending.SlotIdentity.Binding.HotbarId + 1}, slot {pending.SlotIdentity.Binding.SlotId + 1}";
+            return $"Quarantining synthetic macro epoch {quarantine.ExecutionEpoch}; suppressed {syntheticMacroSuppressedCallCount} calls";
         }
 
         if (Volatile.Read(ref turboAcknowledgement) is not null) return "Holding - waiting for the last exact action acknowledgement";
         return turboEngine.Snapshot.State switch
         {
+            HoldRepeatState.Active when macroTurboRuntime is { } runtime =>
+                $"Holding macro hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}",
             HoldRepeatState.Active when turboRuntime is { } runtime =>
                 $"Holding {(runtime.IsMacro ? "captured macro action from " : string.Empty)}hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}",
             HoldRepeatState.NeedsRelease => "Ready for a fresh physical key press",
@@ -3162,6 +4197,20 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
         public bool MacroWasLockedBeforeExecution { get; set; }
 
+        public bool MacroLockObservedDuringExecution { get; set; }
+
+        public Snapshot? MacroSnapshotAtPress { get; set; }
+
+        public SafeActionMacroProfile? MacroProfileAtPress { get; set; }
+
+        public MacroTurboTranscriptBuilder? MacroTranscriptBuilder { get; set; }
+
+        public bool MacroProvenanceDisqualified { get; set; }
+
+        public string? MacroProvenanceFailure { get; set; }
+
+        public ExactActionTuple? OwnedMacroQueueTuple { get; set; }
+
         public TurboAcknowledgementSeed? InitialAcknowledgement { get; set; }
     }
 
@@ -3182,31 +4231,72 @@ internal sealed unsafe class ActionBufferService : IDisposable
         public bool IsMacro => MacroProfile is not null;
     }
 
-    private sealed class PendingMacroCapture(
+    private sealed class MacroTurboRuntime(
         CertifiedHotbarPress press,
         HotbarSlotIdentity slotIdentity,
-        SafeActionMacroProfile profile,
+        SafeActionMacroProfile macroProfile,
+        Snapshot snapshot,
+        string compatibilitySignature,
         long generation,
-        long expiresAtMilliseconds)
+        HoldRepeatStartRequest startRequest,
+        long initialMacroLockDeadlineMilliseconds,
+        MacroTurboTranscriptBuilder? initialTranscriptBuilder,
+        MacroTurboTranscript? transcript)
     {
         public CertifiedHotbarPress Press { get; } = press;
 
         public HotbarSlotIdentity SlotIdentity { get; } = slotIdentity;
 
-        public SafeActionMacroProfile Profile { get; } = profile;
+        public SafeActionMacroProfile MacroProfile { get; } = macroProfile;
+
+        public Snapshot Snapshot { get; } = snapshot;
+
+        public string CompatibilitySignature { get; } = compatibilitySignature;
 
         public long Generation { get; } = generation;
 
-        public long ExpiresAtMilliseconds { get; } = expiresAtMilliseconds;
+        public HoldRepeatStartRequest StartRequest { get; } = startRequest;
 
-        public Candidate? Candidate { get; set; }
+        public long InitialMacroLockDeadlineMilliseconds { get; } = initialMacroLockDeadlineMilliseconds;
 
-        public int ActionInvocationCount { get; set; }
+        public MacroTurboTranscriptBuilder? InitialTranscriptBuilder { get; set; } = initialTranscriptBuilder;
 
-        public bool Disqualified { get; set; }
+        public MacroTurboTranscript? Transcript { get; set; } = transcript;
 
-        public TurboAcknowledgementSeed? InitialAcknowledgement { get; set; }
+        public bool InitialMacroLockObserved { get; set; }
+
+        public bool InitialMacroLockCompleted { get; set; }
+
+        public bool OwnsMacroExecutor { get; set; }
+
+        public ExactActionTuple? OwnedQueueTuple { get; set; }
+
+        public long NextExecutionEpoch { get; set; }
+
+        public long ActiveExecutionEpoch { get; set; }
+
+        public MacroTurboExecutionCursor? ActiveExecutionCursor { get; set; }
     }
+
+    private sealed record MacroPulseExecutionScope(
+        MacroTurboRuntime Runtime,
+        HoldRepeatPulseToken Token,
+        long ExecutionEpoch);
+
+    private sealed record SyntheticMacroExecutorQuarantine(
+        long Generation,
+        long PressId,
+        long ExecutionEpoch,
+        long StartedAtMilliseconds,
+        long ExpiresAtMilliseconds);
+
+    private sealed record MacroQueueAttempt(
+        long Generation,
+        MacroTurboRuntime? Runtime,
+        HotbarInputScope? InputScope,
+        ExactActionTuple Attempted,
+        NativeQueueSnapshot QueueBefore,
+        ushort SequenceBefore);
 
     private sealed record TurboAcknowledgementSeed(
         TurboActionEffectExpectation Expectation,
@@ -3245,6 +4335,25 @@ internal sealed unsafe class ActionBufferService : IDisposable
         public RaptureHotbarModule* HotbarModule { get; }
 
         public uint ResolvedActionId { get; }
+
+        public HoldRepeatSafetyState Safety { get; }
+
+        public bool ActionReady { get; }
+    }
+
+    private readonly struct MacroTurboObservation
+    {
+        public MacroTurboObservation(
+            RaptureHotbarModule* hotbarModule,
+            HoldRepeatSafetyState safety,
+            bool actionReady)
+        {
+            HotbarModule = hotbarModule;
+            Safety = safety;
+            ActionReady = actionReady;
+        }
+
+        public RaptureHotbarModule* HotbarModule { get; }
 
         public HoldRepeatSafetyState Safety { get; }
 

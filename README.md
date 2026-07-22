@@ -6,12 +6,13 @@ only because of a short GCD/local recast or animation lock, PulseQueue can
 retain that exact action briefly and submit it once when the client reports it
 ready. This includes the intended PvP Guard cooldown-edge use case.
 
-Version 0.3.1 also contains an optional exact-action Turbo mode for a tightly
-limited keyboard testing scope. It is disabled by default. Unlike the one-shot
-buffer, holding an eligible key may intentionally execute its one captured
-action multiple times over the lifetime of that hold. The slot itself is never
-synthetically rerun. Macro slots require a second, separate opt-in and a strict
-single-action safety analysis.
+Version 0.3.2 also contains two optional Turbo modes for a tightly limited
+keyboard testing scope. Both are disabled by default. Direct-action Turbo may
+repeat only one immutable captured action/target tuple. The separately enabled
+Macro Turbo instead repeats the same physically certified standard-hotbar macro
+slot; FFXIV's native macro executor, not PulseQueue, evaluates that slot's
+ordered action lines and targets on each invocation. Neither mode changes the
+exact, at-most-once one-shot buffer contract.
 
 This is an open testing release, not an official Dalamud plugin.
 
@@ -53,36 +54,69 @@ This is an open testing release, not an official Dalamud plugin.
   become an owner. The Turbo testing scope accepts direct `Action` slots whose
   single observed invocation is an `Action` or `PvPAction`. `PvPCombo` slots
   remain excluded until their route identity can be proven end to end.
-- Macro Turbo has its own explicit opt-in, also defaulting off. It can repeat
-  from an exact keyboard-bound standard-hotbar `Macro` slot containing one
-  `/ac`, `/action`, `/pvpac`, or `/pvpaction` command. Icon/error metadata and
-  at most one `/assist` before the action are allowed. Enabling native Turbo
-  alone does not enable Macro Turbo.
-- Wait directives, a second action, chat, target, marker, item, gearset, hotbar,
-  and unknown commands reject the macro. The physical press runs the verified
-  macro once; later pulses repeat only the exact observed native action tuple
-  and target. They never replay the macro, its `/assist`, or metadata lines.
-- Items, mouse clicks, controller and cross-hotbar input, every
-  cast-time/ground-target/player-movement direct action, and calls originating
-  from another plugin never start native Turbo ownership.
-- A held eligible slot may execute its captured action multiple times. Every
-  repeat invokes exactly one immutable action/target tuple; PulseQueue never
-  reruns the slot, follows a later combo transformation, chooses another skill
-  or target, or creates a FIFO rotation.
+- Macro Turbo has its own explicit opt-in, also defaulting off. It accepts an
+  exact keyboard-bound standard-hotbar `Macro` slot containing one or more
+  `/ac`, `/action`, `/pvpac`, or `/pvpaction` commands plus only icon/error
+  metadata. Enabling native Turbo alone does not enable Macro Turbo.
+- A zero-action macro, `/assist`, waits, chat, target-changing commands, items,
+  markers, gearsets, hotbar mutation, and unknown or otherwise non-metadata
+  commands reject Macro Turbo ownership. The original physical press remains
+  vanilla. Each later pulse invokes that same certified macro slot exactly
+  once; it does not invoke a captured action tuple.
+- FFXIV evaluates the allowed action lines in their authored order and resolves
+  their authored targets. PulseQueue does not select a line, skill, fallback,
+  or target and does not rewrite the macro. Consequently, an eligible
+  multi-action macro can produce a different action than its previous pulse
+  when FFXIV's own native macro rules choose a different authored line. This is
+  Macro Turbo slot repetition, not the direct-action exact-tuple contract.
+- Static analysis supplies an exact `ActionCount`. The certified physical macro
+  execution must emit exactly that many eligible Macro-mode action calls. Their
+  ordered transcript preserves duplicates and freezes action type, requested
+  action ID, target, extra parameter, route ID, and resolver-target fingerprint.
+  A missing, extra, reordered, or semantically different call rejects or
+  cancels ownership.
+- Resolved action IDs may change between macro executions only because FFXIV
+  re-resolves the same requested transcript entry. Before every due pulse and
+  on every emitted action call, the current resolved ID must again pass all
+  live eligibility, target, compatibility, and MOAction ownership checks.
+- Items, mouse clicks, controller and cross-hotbar input, every cast-time,
+  area/ground-target, or player-movement action, MOAction-owned action IDs, and
+  calls originating from another plugin never start or continue native Turbo
+  ownership. These exclusions apply to every Macro Turbo transcript entry as
+  well as to direct actions.
+- A held eligible direct-action slot may execute its captured action multiple
+  times. Every direct repeat invokes exactly one immutable action/target tuple;
+  PulseQueue never reruns the direct slot, follows a later combo transformation,
+  chooses another skill or target, or creates a FIFO rotation. Macro Turbo is
+  the explicit exception that repeats the one certified macro slot and leaves
+  all line and target resolution to FFXIV.
 - Releasing the exact owning key/chord cancels it. A newer certified physical
   edge preempts an older hold before the newer slot executes. Any newer native
   hotbar/action invocation also cancels the old hold even when the new input
   cannot become a Turbo owner; the older key never resumes automatically.
-- After the original press, a one-shot replay, or a Turbo pulse is sent, the
-  next pulse is blocked until a local-player action effect matches its exact
-  action type, requested/resolved ID, and immediate or queue-relative source
-  sequence. A locally rejected or unprovable send, or a missing
-  acknowledgement, ends the hold without retry.
+- After an exact direct-action original, one-shot replay, or direct Turbo pulse
+  is sent, the next direct pulse is blocked until a local-player action effect
+  matches its exact action type, requested/resolved ID, and immediate or
+  queue-relative source sequence. Macro Turbo never converts an observed macro
+  result into a one-shot replay or action retry.
 - Every hold has a hard 30-second lifetime and then requires a fresh physical
   release/press, even if the key remains down.
-- Death, stun, knockback or forced movement, zoning, logout, job/PvP-context
-  change, plugin disable, unsafe compatibility state, and the existing
-  fail-closed safety transitions cancel the active hold.
+- Key-up, any newer certified physical press, target/context change, death,
+  stun, knockback or forced movement, zoning, logout, job/PvP-context change,
+  plugin disable, unsafe compatibility state, and the existing fail-closed
+  safety transitions cancel either kind of active hold. A canceled owner never
+  resumes without a fresh physical press.
+- A synthetic macro-slot call may forward only the next authorized entry in its
+  frozen ordered transcript. An ineligible, extra, reordered, stale, or
+  otherwise unauthorized synthetic Macro-mode call is suppressed before native
+  action execution; the player's original physical macro path is never
+  suppressed by this rule.
+- If a synthetic slot remains asynchronous under native `MacroLocked` when its
+  owner is canceled or provenance fails, PulseQueue quarantines that one
+  synthetic executor epoch. Only its later Macro-mode action calls are
+  suppressed. Normal- and Queue-mode calls remain native. The quarantine clears
+  when `MacroLocked` ends, after at most two seconds, on a newer certified root
+  macro press once unlocked, or during plugin disposal.
 - ReAction Turbo Hotbars and Macro Queue must remain off. PulseQueue will not
   run competing repeat owners or accept rewritten macro queue provenance.
 - NoClippy remains the only animation-lock correction owner. Native Turbo and
@@ -100,11 +134,16 @@ plugins are excluded.
 That one-shot path continues to observe keyboard, mouse, and controller paths
 that run through FFXIV's standard slot executor. The optional native Turbo path
 is narrower: keyboard-bound standard hotbars and direct `Action` slots with one
-exactly correlated `Action`/`PvPAction` invocation only, plus exact `Macro`
-slots when the separate Macro Turbo opt-in is enabled. `PvPCombo`, items,
-mouse, controller, cross-hotbar input, and arbitrary macros cannot own Turbo. A
-safe action-macro pulse repeats only the immutable native action tuple observed
-from the original physical execution.
+exactly correlated `Action`/`PvPAction` invocation only, plus statically
+verified action-only `Macro` slots when the separate Macro Turbo opt-in is
+enabled. `PvPCombo`, items, mouse, controller, cross-hotbar input, and macros
+containing resolver/state-changing or unknown commands cannot own Turbo. A
+direct pulse repeats an immutable native action tuple; a Macro Turbo pulse
+repeats only the certified standard-hotbar macro slot and lets FFXIV evaluate
+its one-or-more authored action lines. Macro ownership additionally requires a
+complete ordered transcript whose observed count equals the static
+`ActionCount`; duplicates remain distinct, and every entry must stay live-
+eligible and outside the cast, area/ground, movement, and MOAction exclusions.
 
 ## Adaptive timing
 
@@ -201,7 +240,7 @@ This implementation and its review were substantially AI-assisted. The
 repository publishes the complete source, deterministic tests, build scripts,
 release fingerprint, and mandatory live-test matrix so a human maintainer can
 audit and validate every native interaction. No claim of complete human
-in-game validation is made for version 0.3.1.0.
+in-game validation is made for version 0.3.2.0.
 
 The compatibility design was checked against the exact upstream implementations
 used for this testing profile: [NoClippy 0.5.0.24 animation-lock handling](https://github.com/UnknownX7/NoClippy/blob/3f4b37739bbdccd1833b042018b01be84a7d382b/Modules/AnimationLock.cs)
@@ -217,12 +256,15 @@ use the native `ActionType` and action-ID domains matched by PulseQueue.
 ## Validation status
 
 The dependency-free state machines and runtime safety helpers have deterministic
-invariant coverage, including a seeded adversarial trace, exact native-queue
-classification, newest-generation replacement, mounted cancellation, a
-concurrent consume race, and terminal rejection of a Turbo pulse. The packaged
-0.3.1 artifact is deliberately testing-exclusive; physical ownership, key-up,
-exact-action cadence, acknowledgement, and every Turbo transition remain explicit
-live-test gates rather than claimed results.
+invariant coverage: 119/119 self-tests pass, including a seeded adversarial
+trace, exact native-queue classification, newest-generation replacement,
+ordered Macro Turbo transcripts with duplicates and exact counts, dynamic
+resolved-ID semantics, mounted cancellation, a concurrent consume race, and
+terminal rejection of a Turbo pulse. The packaged
+0.3.2 artifact is deliberately testing-exclusive; physical ownership, key-up,
+direct exact-action cadence, certified same-macro-slot cadence, acknowledgement,
+and every Turbo transition remain explicit live-test gates rather than claimed
+results.
 The native integration must additionally pass the live matrix in
 [`docs/LIVE_TEST_MATRIX.md`](docs/LIVE_TEST_MATRIX.md) on the current FFXIV
 patch before this testing flag can be removed. Until that evidence exists, do
