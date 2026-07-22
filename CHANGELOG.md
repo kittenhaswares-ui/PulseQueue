@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.3.0.0 — 2026-07-22
+
+- Adds an opt-in native same-slot repeat source for keyboard-bound standard
+  hotbar slots. It is disabled by default and accepts only direct `Action`
+  slots with one correlated `Action`/`PvPAction` invocation. `PvPCombo`, macros,
+  items, mouse clicks, controller/cross-hotbar input, and plugin-originated
+  calls are outside its testing scope.
+- Uses explicit physical key ownership: releasing the key stops its repeat,
+  and the newest physical hotbar press cancels an older held slot before the
+  new slot can become the repeat owner.
+- Resolves the exact keyboard key, primary/secondary binding index, and modifier
+  chord from the native keybind record. Gamepad/mouse virtual keys and ambiguous
+  simultaneous bindings fail closed. Any newer native action also cancels the
+  old owner even if it cannot start Turbo itself.
+- Allows a held slot to execute more than one action over time. Each repeat is
+  still a fresh exact invocation of that same slot; it is not a one-shot
+  replay, action substitution, target selector, server-rejection retry, or
+  multi-action queue.
+- Defaults to a 180 ms initial delay and 80 ms repeat interval. Configuration
+  schema 2 normalizes the initial delay to 0–1000 ms and the interval to
+  60–1000 ms; out-of-combat repeat is disabled by default.
+- Blocks every later pulse until a local-player action effect matches the
+  preceding pulse's action type, requested/resolved ID, and source sequence.
+  Local rejection, missing acknowledgement, or the hard 30-second hold limit
+  ends ownership without retry.
+- Cancels repeat ownership on key release, newer physical input, death, stun,
+  knockback/forced movement, zoning, logout, job/PvP-context change, plugin
+  disable, unsafe compatibility state, and other existing safety transitions.
+- Requires ReAction Turbo Hotbars to remain disabled so two independent repeat
+  sources can never compete. NoClippy remains the sole animation-lock writer.
+- Preserves unknown future configuration files without rewriting them and
+  disables Turbo in memory until a compatible build or explicit reset is used.
+
+This is a packaged testing-only 0.3 release. The native live matrix remains
+required before any promotion or production-readiness claim.
+
 ## 0.2.0.0 — 2026-07-22
 
 - Supports NoClippy 0.5.0.24 while leaving animation-lock correction entirely

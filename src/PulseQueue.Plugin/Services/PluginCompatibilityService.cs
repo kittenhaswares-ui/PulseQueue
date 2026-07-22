@@ -231,7 +231,7 @@ internal sealed class PluginCompatibilityService
 
         if (configuration.TurboHotbarsEnabled)
         {
-            conflicts.Add("Disable ReAction's Turbo Hotbars while PulseQueue is enabled.");
+            conflicts.Add("Disable ReAction's Turbo Hotbars; PulseQueue native Turbo can replace it without competing repeat owners.");
             safe = false;
         }
 

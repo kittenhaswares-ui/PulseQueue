@@ -66,6 +66,7 @@ $temporaryDll = [System.IO.Path]::GetTempFileName()
 try {
     $required = @(
         'PulseQueue.Core.dll',
+        'PulseQueue.Core.pdb',
         'PulseQueue.Plugin.deps.json',
         'PulseQueue.Plugin.dll',
         'PulseQueue.Plugin.json'
@@ -74,6 +75,10 @@ try {
     foreach ($name in $required) {
         if ($names -notcontains $name) { throw "Release ZIP is missing $name" }
     }
+    $unexpected = @($names | Where-Object { $required -notcontains $_ })
+    if ($unexpected.Count -ne 0 -or $names.Count -ne $required.Count) {
+        throw "Release ZIP contains unexpected entries: $($unexpected -join ', ')"
+    }
 
     $manifestEntry = $archive.GetEntry('PulseQueue.Plugin.json')
     $reader = [System.IO.StreamReader]::new($manifestEntry.Open())
@@ -81,6 +86,17 @@ try {
     finally { $reader.Dispose() }
 
     if ($packedManifest.InternalName -ne $entry.InternalName) { throw 'Packed manifest InternalName differs.' }
+    # DalamudPackager emits install-manifest fields only and omits repository
+    # channel metadata such as IsTestingExclusive. Source and repo metadata
+    # above remain authoritative. A preserved field may not contradict them.
+    if (($null -ne $packedManifest.PSObject.Properties['IsTestingExclusive']) -and
+        (-not [bool]$packedManifest.IsTestingExclusive)) {
+        throw 'Packed manifest contradicts the testing-exclusive source metadata.'
+    }
+    if ([string]$packedManifest.Description -ne [string]$sourceManifest.Description -or
+        [string]$packedManifest.Description -ne [string]$entry.Description) {
+        throw 'Packed, source, and repository descriptions differ.'
+    }
     if ([string]$packedManifest.AssemblyVersion -ne $effectiveRepoVersion) {
         throw "Packed manifest version differs from effective repo version $effectiveRepoVersion."
     }

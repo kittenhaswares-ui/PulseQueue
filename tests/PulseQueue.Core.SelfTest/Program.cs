@@ -71,6 +71,8 @@ internal static class SelfTests
             ("deterministic randomized trace preserves invariants", DeterministicRandomizedTracePreservesInvariants),
         };
         tests.AddRange(RuntimeCoreTests.All());
+        tests.AddRange(HoldRepeatTests.All());
+        tests.AddRange(PluginConfigurationTests.All());
 
         var failures = new List<string>();
         foreach (var (name, body) in tests)
