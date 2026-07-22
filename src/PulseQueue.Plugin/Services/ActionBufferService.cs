@@ -47,6 +47,15 @@ internal sealed record BufferDiagnostics(
     long NativeQueueBlocked,
     long OwnedNativeQueueReplacements,
     long IntegrationExclusions,
+    bool TurboConfigured,
+    bool TurboInputAvailable,
+    HoldRepeatState TurboState,
+    long TurboStarts,
+    long TurboPulses,
+    long TurboAccepted,
+    long TurboRejected,
+    HoldRepeatCancelReason TurboLastCancelReason,
+    string TurboStatus,
     CancelReason LastCancelReason,
     string LastEvent);
 
@@ -65,13 +74,18 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private const int MaximumActionEffectTargets = 32;
     private const byte KnockbackActionEffectType = 33;
     private const int CompatibilityPollIntervalMilliseconds = 500;
+    private const long MaximumTurboAcknowledgementMilliseconds = 2_000;
     private const uint ReActionCameraRelativeMovementException = 29494;
+    private const uint DirectActionHotbarSlotType = 1;
 
     [ThreadStatic]
     private static int hotbarExecutionDepth;
 
     [ThreadStatic]
     private static bool replaying;
+
+    [ThreadStatic]
+    private static bool turboDispatching;
 
     [ThreadStatic]
     private static HotbarInputScope? activeHotbarInput;
@@ -105,7 +119,11 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private readonly Hook<RaptureHotbarModule.Delegates.ExecuteSlotById> executeSlotByIdHook;
     private readonly Hook<ActionEffectHandler.Delegates.Receive> receiveActionEffectHook;
 
+    private PhysicalHotbarInputSource? physicalHotbarInput;
+    private HoldRepeatEngine turboEngine;
+
     private RuntimeAction? pendingRuntimeAction;
+    private TurboRuntime? turboRuntime;
     private IReadOnlyList<string> activeConflicts = Array.Empty<string>();
     private IReadOnlyList<string> activeIntegrations = Array.Empty<string>();
     private IReadOnlySet<uint> excludedIntegrationActionIds = new HashSet<uint>();
@@ -124,12 +142,20 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private long observedHotbarInputCount;
     private long replacedPendingCount;
     private long integrationExclusionCount;
+    private long turboStartCount;
+    private long turboPulseCount;
+    private long turboAcceptedCount;
+    private long turboRejectedCount;
+    private long latestCertifiedPressId;
+    private TurboAcknowledgement? turboAcknowledgement;
     private uint localEntityId;
     private int forcedMovementObserved;
     private int timingHookErrorLogged;
     private bool faulted;
     private bool faultLogged;
     private bool disposed;
+    private string turboInputUnavailableReason = string.Empty;
+    private HoldRepeatCancelReason turboLastCancelReason;
     private string lastEvent = "Initialized";
 
     public ActionBufferService(
@@ -154,6 +180,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
         this.log = log;
         this.configuration = configuration;
         compatibility = new PluginCompatibilityService(pluginInterface);
+        turboEngine = new HoldRepeatEngine(CreateTurboOptions());
+
+        try
+        {
+            physicalHotbarInput = new PhysicalHotbarInputSource(interop, OnCertifiedPhysicalPress);
+        }
+        catch (Exception exception)
+        {
+            turboInputUnavailableReason = "physical keyboard input hook unavailable";
+            log.Warning(exception, "PulseQueue native Turbo is unavailable; the one-shot buffer will remain usable.");
+        }
 
         useActionHook = interop.HookFromAddress<ActionManager.Delegates.UseAction>(
             ActionManager.MemberFunctionPointers.UseAction,
@@ -193,6 +230,15 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 nativeQueueBlockedCount,
                 ownedNativeQueueReplacementCount,
                 integrationExclusionCount,
+                configuration.TurboEnabled,
+                physicalHotbarInput is not null,
+                turboEngine.Snapshot.State,
+                turboStartCount,
+                turboPulseCount,
+                turboAcceptedCount,
+                turboRejectedCount,
+                turboLastCancelReason,
+                DescribeTurboState(),
                 engine.LastCancelReason,
                 lastEvent);
         }
@@ -209,9 +255,36 @@ internal sealed unsafe class ActionBufferService : IDisposable
             executeSlotByIdHook.Enable();
             receiveActionEffectHook.Enable();
             useActionHook.Enable();
+            if (physicalHotbarInput is { } inputSource)
+            {
+                try
+                {
+                    inputSource.Start();
+                }
+                catch (Exception exception)
+                {
+                    DisposeSilently(inputSource);
+                    physicalHotbarInput = null;
+                    turboInputUnavailableReason = "physical keyboard input hook could not be enabled";
+                    log.Warning(exception, "PulseQueue native Turbo is unavailable; the one-shot buffer remains enabled.");
+                }
+            }
             framework.Update += OnFrameworkUpdate;
             pluginInterface.ActivePluginsChanged += OnActivePluginsChanged;
-            log.Information("PulseQueue hooks enabled. Buffer cap is {Cap} ms.", BufferEngine.AbsoluteHoldCapMilliseconds);
+            if (activeConflicts.Count > 0)
+            {
+                log.Warning(
+                    "PulseQueue loaded suspended. Resolve: {Conflicts}",
+                    string.Join("; ", activeConflicts));
+            }
+            else
+            {
+                log.Information(
+                    "PulseQueue ready. Smart-buffer cap={Cap} ms; native Turbo input={TurboAvailability}; Turbo configured={TurboConfigured}.",
+                    BufferEngine.AbsoluteHoldCapMilliseconds,
+                    physicalHotbarInput is null ? "unavailable" : "available",
+                    configuration.TurboEnabled);
+            }
         }
         catch
         {
@@ -221,6 +294,8 @@ internal sealed unsafe class ActionBufferService : IDisposable
             DisposeSilently(receiveActionEffectHook);
             DisposeSilently(executeSlotByIdHook);
             DisposeSilently(executeSlotHook);
+            if (physicalHotbarInput is { } inputSource) DisposeSilently(inputSource);
+            physicalHotbarInput = null;
             disposed = true;
             throw;
         }
@@ -234,6 +309,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             inputGenerations.Invalidate();
             engine.Cancel(reason);
             pendingRuntimeAction = null;
+            CancelTurboUnsafe(ToTurboCancelReason(reason), detail);
             lastEvent = detail;
         }
     }
@@ -261,51 +337,90 @@ internal sealed unsafe class ActionBufferService : IDisposable
         receiveActionEffectHook.Dispose();
         executeSlotByIdHook.Dispose();
         executeSlotHook.Dispose();
+        physicalHotbarInput?.Dispose();
+        physicalHotbarInput = null;
         sentSequences.Clear();
     }
 
     private byte ExecuteSlotDetour(RaptureHotbarModule* thisPtr, RaptureHotbarModule.HotbarSlot* slot)
     {
-        var rootInput = hotbarExecutionDepth == 0 && !replaying;
+        var rootInput = hotbarExecutionDepth == 0 && !replaying && !turboDispatching;
         if (rootInput)
         {
-            BeginHotbarInput();
+            try
+            {
+                CertifiedHotbarPress? certifiedPress = null;
+                if (physicalHotbarInput?.TryConsume(thisPtr, slot, NowMilliseconds, out var observedPress) == true)
+                {
+                    certifiedPress = observedPress;
+                }
+
+                BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
+            }
+            catch (Exception exception)
+            {
+                activeHotbarInput = null;
+                Fault(exception, "Physical hotbar certification failed");
+            }
         }
 
+        var originalCompleted = false;
         hotbarExecutionDepth++;
         try
         {
-            return executeSlotHook.Original(thisPtr, slot);
+            var result = executeSlotHook.Original(thisPtr, slot);
+            originalCompleted = true;
+            return result;
         }
         finally
         {
             hotbarExecutionDepth--;
             if (rootInput)
             {
-                CompleteHotbarInput();
+                if (originalCompleted) CompleteHotbarInput();
+                else activeHotbarInput = null;
             }
         }
     }
 
     private byte ExecuteSlotByIdDetour(RaptureHotbarModule* thisPtr, uint hotbarId, uint slotId)
     {
-        var rootInput = hotbarExecutionDepth == 0 && !replaying;
+        var rootInput = hotbarExecutionDepth == 0 && !replaying && !turboDispatching;
         if (rootInput)
         {
-            BeginHotbarInput();
+            try
+            {
+                CertifiedHotbarPress? certifiedPress = null;
+                if (physicalHotbarInput?.TryConsume(hotbarId, slotId, NowMilliseconds, out var observedPress) == true)
+                {
+                    certifiedPress = observedPress;
+                }
+
+                var slot = thisPtr == null ? null : thisPtr->GetSlotById(hotbarId, slotId);
+                BeginHotbarInput(certifiedPress, CaptureHotbarSlotIdentity(certifiedPress, slot));
+            }
+            catch (Exception exception)
+            {
+                activeHotbarInput = null;
+                Fault(exception, "Physical hotbar certification failed");
+            }
         }
 
+        var originalCompleted = false;
         hotbarExecutionDepth++;
         try
         {
-            return executeSlotByIdHook.Original(thisPtr, hotbarId, slotId);
+            var result = executeSlotByIdHook.Original(thisPtr, hotbarId, slotId);
+            originalCompleted = true;
+            return result;
         }
         finally
         {
             hotbarExecutionDepth--;
             if (rootInput)
             {
-                CompleteHotbarInput();
+                if (originalCompleted) CompleteHotbarInput();
+                else activeHotbarInput = null;
             }
         }
     }
@@ -321,10 +436,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
         bool* outOptAreaTargeted)
     {
         Candidate? candidate = null;
-        var certifiedHotbarInput = hotbarExecutionDepth > 0 && !replaying;
+        var certifiedHotbarInput = hotbarExecutionDepth > 0 && !replaying && !turboDispatching;
         var sequenceBefore = thisPtr == null ? (ushort)0 : thisPtr->LastUsedActionSequence;
 
-        if (!replaying)
+        if (!replaying && !turboDispatching)
         {
             lock (dispatchGate)
             {
@@ -339,6 +454,16 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 {
                     try
                     {
+                        if (activeHotbarInput is { } inputScope)
+                        {
+                            inputScope.ActionInvocationCount++;
+                            if (inputScope.ActionInvocationCount > 1)
+                            {
+                                inputScope.TurboCandidate = null;
+                                inputScope.TurboDisqualified = true;
+                            }
+                        }
+
                         candidate = TryCreateCandidate(
                             thisPtr,
                             actionType,
@@ -389,6 +514,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
                                 };
                             }
                         }
+
+                        if (candidate is { } turboCandidate
+                            && activeHotbarInput is { ActionInvocationCount: 1, TurboDisqualified: false } turboScope)
+                        {
+                            turboScope.TurboCandidate = turboCandidate;
+                        }
                     }
                     catch (Exception exception)
                     {
@@ -435,13 +566,18 @@ internal sealed unsafe class ActionBufferService : IDisposable
         return result;
     }
 
-    private void BeginHotbarInput()
+    private void BeginHotbarInput(
+        CertifiedHotbarPress? certifiedPress,
+        HotbarSlotIdentity? slotIdentity)
     {
         var replacedPending = engine.Pending is not null;
         observedHotbarInputCount++;
         if (replacedPending) replacedPendingCount++;
         Cancel(CancelReason.Replaced, "Replaced by the newest hotbar input");
-        activeHotbarInput = new HotbarInputScope(inputGenerations.Current);
+        activeHotbarInput = new HotbarInputScope(
+            inputGenerations.Current,
+            certifiedPress,
+            slotIdentity);
         if (configuration.DetailedLogging)
         {
             log.Debug(
@@ -451,11 +587,42 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
+    private void OnCertifiedPhysicalPress(CertifiedHotbarPress press)
+    {
+        try
+        {
+            lock (dispatchGate)
+            {
+                if (disposed) return;
+                Volatile.Write(ref latestCertifiedPressId, press.PressId);
+                if (engine.Pending is not null) replacedPendingCount++;
+                Cancel(
+                    CancelReason.Replaced,
+                    $"Physical hotbar press {press.PressId} preempted every older buffered or Turbo owner");
+            }
+        }
+        catch (Exception exception)
+        {
+            try
+            {
+                Fault(exception, "Physical press preemption failed");
+            }
+            catch
+            {
+                // Preserve the original preemption failure below.
+            }
+
+            // The input source catches this and discards the uncertified pending
+            // edge, so the native pressed result still remains authoritative.
+            throw;
+        }
+    }
+
     private void CompleteHotbarInput()
     {
         var scope = activeHotbarInput;
         activeHotbarInput = null;
-        if (scope is not { MaySupersedeOwnedQueue: true }) return;
+        if (scope is null) return;
 
         try
         {
@@ -463,8 +630,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
             {
                 if (!inputGenerations.IsCurrent(scope.Generation)) return;
                 var actionManager = ActionManager.Instance();
-                if (actionManager == null) return;
-                TryReplaceOwnedNativeQueue(actionManager, scope.Generation, "after the complete hotbar call");
+                if (actionManager != null && scope.MaySupersedeOwnedQueue)
+                {
+                    TryReplaceOwnedNativeQueue(actionManager, scope.Generation, "after the complete hotbar call");
+                }
+
+                TryStartTurbo(scope);
             }
         }
         catch (Exception exception)
@@ -472,6 +643,481 @@ internal sealed unsafe class ActionBufferService : IDisposable
             Fault(exception, "Hotbar completion validation failed");
         }
     }
+
+    private void TryStartTurbo(HotbarInputScope scope)
+    {
+        if (!configuration.Enabled
+            || !configuration.TurboEnabled
+            || configuration.DryRun
+            || physicalHotbarInput is not { } inputSource
+            || activeConflicts.Count > 0
+            || compatibilityQuarantineFrames > 0
+            || scope.CertifiedPress is not { } press
+            || scope.SlotIdentity is not { } slotIdentity
+            || scope.TurboCandidate is not { } candidate
+            || scope.TurboDisqualified
+            || scope.ActionInvocationCount != 1
+            || !inputGenerations.IsCurrent(scope.Generation)
+            || Volatile.Read(ref latestCertifiedPressId) != press.PressId
+            || (!configuration.TurboOutOfCombat && !condition[ConditionFlag.InCombat]))
+        {
+            return;
+        }
+
+        if (candidate.InputGeneration != scope.Generation
+            || slotIdentity.CommandType != DirectActionHotbarSlotType
+            || slotIdentity.CommandId != candidate.RequestedActionId
+            || !inputSource.IsStillHeld(press)
+            || !TryReadCurrentSlotIdentity(press, out var currentIdentity)
+            || currentIdentity != slotIdentity
+            || !compatibility.IsLiveReActionProfileCurrent()
+            || !compatibility.IsLiveMOActionUnowned(candidate.RequestedActionId, candidate.ResolvedActionId)
+            || !ExplicitTargetStillExists(candidate))
+        {
+            return;
+        }
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null
+            || actionManager->GetActionStatus(
+                candidate.ActionType,
+                candidate.ResolvedActionId,
+                candidate.TargetId,
+                false,
+                false) != 0)
+        {
+            return;
+        }
+
+        var options = CreateTurboOptions();
+        if (turboEngine.Options != options)
+        {
+            CancelTurboUnsafe(HoldRepeatCancelReason.PluginChange, "Turbo timing changed");
+            turboEngine = new HoldRepeatEngine(options);
+        }
+
+        // The certified edge proves that this newly pressed control was released
+        // before the edge. That is sufficient to leave the fail-closed startup state,
+        // even when a different, older key remains physically held.
+        if (turboEngine.Snapshot.State == HoldRepeatState.NeedsRelease)
+        {
+            turboEngine.ObserveRelease();
+        }
+
+        var intentFingerprint = NonZeroFingerprint(
+            (ulong)candidate.ActionType,
+            candidate.RequestedActionId,
+            candidate.TargetId,
+            candidate.ExtraParam,
+            candidate.ComboRouteId,
+            candidate.Snapshot.TargetFingerprint,
+            candidate.Snapshot.ContextFingerprint);
+        var request = new HoldRepeatStartRequest(
+            press.PressId,
+            scope.Generation,
+            slotIdentity.ControlFingerprint,
+            intentFingerprint,
+            IsCertifiedFreshPress: true);
+        var result = turboEngine.TryStart(request, NowMilliseconds);
+        if (result is not (HoldRepeatStartResult.Started or HoldRepeatStartResult.Replaced))
+        {
+            return;
+        }
+
+        turboRuntime = new TurboRuntime(
+            press,
+            slotIdentity,
+            candidate,
+            compatibilitySignature,
+            request);
+        turboStartCount++;
+        lastEvent = $"Turbo owns hotbar {slotIdentity.Binding.HotbarId + 1}, slot {slotIdentity.Binding.SlotId + 1}";
+        if (configuration.DetailedLogging)
+        {
+            log.Information(
+                "Turbo start press={PressId}, generation={Generation}, hotbar={Hotbar}, slot={Slot}, type={Type}, action={Requested}->{Resolved}, result={Result}.",
+                press.PressId,
+                scope.Generation,
+                slotIdentity.Binding.HotbarId + 1,
+                slotIdentity.Binding.SlotId + 1,
+                candidate.ActionType,
+                candidate.RequestedActionId,
+                candidate.ResolvedActionId,
+                result);
+        }
+    }
+
+    private void ProcessTurbo(long now, long frameGap)
+    {
+        lock (dispatchGate)
+        {
+            var snapshot = turboEngine.Snapshot;
+            if (!snapshot.HasActiveHold)
+            {
+                turboRuntime = null;
+                Interlocked.Exchange(ref turboAcknowledgement, null);
+                return;
+            }
+
+            if (frameGap < 0 || frameGap > MaximumFrameGapMilliseconds)
+            {
+                CancelTurboUnsafe(
+                    HoldRepeatCancelReason.InputLost,
+                    $"Turbo cancelled after {frameGap} ms frame gap");
+                return;
+            }
+
+            if (turboRuntime is not { } runtime)
+            {
+                CancelTurboUnsafe(HoldRepeatCancelReason.Fault, "Turbo runtime token mismatch");
+                return;
+            }
+
+            var due = now >= snapshot.NextPulseAtMilliseconds;
+            var observation = ObserveTurbo(runtime, checkLiveMOAction: due);
+            var acknowledgement = Volatile.Read(ref turboAcknowledgement);
+            var decision = turboEngine.Tick(
+                now,
+                observation.Safety,
+                observation.ActionReady && acknowledgement is null);
+            if (decision.Kind == HoldRepeatDecisionKind.Cancelled)
+            {
+                CancelTurboUnsafe(
+                    decision.CancelReason,
+                    $"Turbo cancelled: {decision.CancelReason}");
+                return;
+            }
+
+            acknowledgement = Volatile.Read(ref turboAcknowledgement);
+            if (acknowledgement is not null)
+            {
+                if (acknowledgement.StartedAtMilliseconds <= 0
+                    || now - acknowledgement.StartedAtMilliseconds < 0
+                    || now - acknowledgement.StartedAtMilliseconds > MaximumTurboAcknowledgementMilliseconds)
+                {
+                    if (!ReferenceEquals(
+                            Interlocked.CompareExchange(ref turboAcknowledgement, null, acknowledgement),
+                            acknowledgement))
+                    {
+                        return;
+                    }
+
+                    turboRejectedCount++;
+                    CancelTurboUnsafe(
+                        HoldRepeatCancelReason.PulseRejected,
+                        "Turbo received no matching action-effect acknowledgement; hold ended without retry");
+                }
+
+                return;
+            }
+
+            if (decision.Kind != HoldRepeatDecisionKind.Pulse) return;
+            DispatchTurboPulse(runtime, decision.Pulse);
+        }
+    }
+
+    private void DispatchTurboPulse(TurboRuntime runtime, HoldRepeatPulseToken token)
+    {
+        lock (dispatchGate)
+        {
+            if (!turboEngine.IsTokenCurrent(token)
+                || !ReferenceEquals(turboRuntime, runtime)
+                || engine.Pending is not null)
+            {
+                return;
+            }
+
+            var observation = ObserveTurbo(runtime, checkLiveMOAction: true);
+            if (!IsTurboSafetySafe(observation.Safety))
+            {
+                CancelTurboUnsafe(
+                    GetTurboCancellationReason(observation.Safety),
+                    "Turbo final safety check failed");
+                return;
+            }
+
+            if (!observation.ActionReady
+                || observation.ActionManager == null
+                || observation.HotbarModule == null)
+            {
+                return;
+            }
+
+            var actionManager = observation.ActionManager;
+            var sequenceBefore = actionManager->LastUsedActionSequence;
+            var queueBefore = CaptureNativeQueue(actionManager);
+            byte result;
+            turboDispatching = true;
+            hotbarExecutionDepth++;
+            try
+            {
+                result = executeSlotByIdHook.Original(
+                    observation.HotbarModule,
+                    runtime.SlotIdentity.Binding.HotbarId,
+                    runtime.SlotIdentity.Binding.SlotId);
+            }
+            finally
+            {
+                hotbarExecutionDepth--;
+                turboDispatching = false;
+            }
+
+            turboPulseCount++;
+            var sequenceAfter = actionManager->LastUsedActionSequence;
+            var queueAfter = CaptureNativeQueue(actionManager);
+            var sequenceAdvanced = sequenceAfter != sequenceBefore;
+            var exactTuple = runtime.Candidate.ExactTuple with
+            {
+                ResolvedActionId = observation.ResolvedActionId,
+            };
+            var nativeOutcome = NativeActionOutcomeClassifier.Classify(
+                result != 0 || sequenceAdvanced,
+                queueBefore,
+                queueAfter,
+                exactTuple);
+
+            if (nativeOutcome == NativeActionOutcome.ImmediateAcceptance && sequenceAdvanced)
+            {
+                nativeQueueOwnership.Clear();
+                RecordSentSequence(sequenceAfter, NowMilliseconds);
+                if (!BeginTurboAcknowledgement(
+                        runtime,
+                        token,
+                        TurboAcknowledgementSequenceMode.ImmediateExact,
+                        sequenceAfter,
+                        exactTuple))
+                {
+                    RejectTurboPulseUnsafe(
+                        $"Turbo immediate action {observation.ResolvedActionId} had no valid acknowledgement identity");
+                    return;
+                }
+            }
+            else if (nativeOutcome == NativeActionOutcome.MatchingNewQueue && !sequenceAdvanced)
+            {
+                var claimed = nativeQueueOwnership.TryClaimNewQueue(
+                    runtime.Candidate.InputGeneration,
+                    sequenceAfter,
+                    queueBefore,
+                    queueAfter,
+                    exactTuple);
+                if (!claimed
+                    || !BeginTurboAcknowledgement(
+                        runtime,
+                        token,
+                        TurboAcknowledgementSequenceMode.QueuedAfterBaseline,
+                        sequenceBefore,
+                        exactTuple))
+                {
+                    nativeQueueOwnership.Clear();
+                    RejectTurboPulseUnsafe(
+                        $"Turbo queue for action {observation.ResolvedActionId} could not be proven exact");
+                    return;
+                }
+            }
+            else
+            {
+                // A bool return, foreign/preexisting queue, or simultaneous sequence
+                // plus queue transition is not an exact identity. The one native slot
+                // invocation remains authoritative, but this hold can never retry it.
+                RejectTurboPulseUnsafe(
+                    $"Turbo pulse for action {observation.ResolvedActionId} was {nativeOutcome} with sequenceAdvanced={sequenceAdvanced}");
+                return;
+            }
+
+            turboAcceptedCount++;
+
+            lastEvent = $"Turbo pulsed hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}";
+            if (configuration.DetailedLogging)
+            {
+                log.Information(
+                    "Turbo pulse ordinal={Ordinal}, hotbar={Hotbar}, slot={Slot}, action={Action}, result={Result}, sequence={Before}->{After}, queued={Queued}.",
+                    token.Ordinal,
+                    runtime.SlotIdentity.Binding.HotbarId + 1,
+                    runtime.SlotIdentity.Binding.SlotId + 1,
+                    observation.ResolvedActionId,
+                    result,
+                    sequenceBefore,
+                    sequenceAfter,
+                    queueAfter.IsQueued);
+            }
+        }
+    }
+
+    private TurboObservation ObserveTurbo(TurboRuntime runtime, bool checkLiveMOAction)
+    {
+        var inputSource = physicalHotbarInput;
+        var stableInputContext = !disposed
+            && clientState.IsLoggedIn
+            && !IsBetweenAreas
+            && clientState.TerritoryType == runtime.Candidate.Snapshot.TerritoryId;
+        var physicalControlDown = stableInputContext
+            && inputSource?.IsStillHeld(runtime.Press) == true;
+        var bindingMatches = Volatile.Read(ref latestCertifiedPressId) == runtime.Press.PressId
+            && TryReadCurrentSlotIdentity(runtime.Press, out var currentIdentity)
+            && currentIdentity == runtime.SlotIdentity;
+        var actionManager = ActionManager.Instance();
+        var resolvedActionId = actionManager == null
+            ? 0
+            : actionManager->GetAdjustedActionId(runtime.Candidate.RequestedActionId);
+        var profileMatches = resolvedActionId != 0
+            && TryGetEligibleActionProfile(
+                runtime.Candidate.ActionType,
+                resolvedActionId,
+                runtime.Candidate.TargetId,
+                out var includeResolverTargets)
+            && includeResolverTargets == runtime.Candidate.IncludeResolverTargets;
+        var currentSnapshot = resolvedActionId == 0
+            ? null
+            : CaptureSnapshot(
+                runtime.Candidate.TargetId,
+                resolvedActionId,
+                runtime.Candidate.IncludeResolverTargets);
+        var targetMatches = currentSnapshot is { } observedSnapshot
+            && observedSnapshot.TargetFingerprint == runtime.Candidate.Snapshot.TargetFingerprint
+            && ExplicitTargetStillExists(runtime.Candidate);
+        var territoryMatches = currentSnapshot is { } territorySnapshot
+            && territorySnapshot.TerritoryId == runtime.Candidate.Snapshot.TerritoryId;
+        var instanceMatches = currentSnapshot is { } instanceSnapshot
+            && instanceSnapshot.ContextFingerprint == runtime.Candidate.Snapshot.ContextFingerprint;
+        var pluginStateMatches = string.Equals(
+                compatibilitySignature,
+                runtime.CompatibilitySignature,
+                StringComparison.Ordinal)
+            && compatibility.IsLiveReActionProfileCurrent()
+            && (!checkLiveMOAction
+                || compatibility.IsLiveMOActionUnowned(
+                    runtime.Candidate.RequestedActionId,
+                    resolvedActionId));
+        var local = objectTable.LocalPlayer;
+        var knockbackActive = condition[ConditionFlag.BeingMoved]
+            || Volatile.Read(ref forcedMovementObserved) != 0;
+        var turboEnabled = configuration.Enabled
+            && configuration.TurboEnabled
+            && !configuration.DryRun
+            && (configuration.TurboOutOfCombat || condition[ConditionFlag.InCombat]);
+        var safety = new HoldRepeatSafetyState(
+            Enabled: turboEnabled && !disposed,
+            ConflictDetected: activeConflicts.Count > 0 || compatibilityQuarantineFrames > 0,
+            LoggedIn: clientState.IsLoggedIn && local is not null && !IsBetweenAreas,
+            IsAlive: local is { IsDead: false } && !condition[ConditionFlag.Unconscious],
+            IsMounted: condition[ConditionFlag.Mounted],
+            IsStunned: IsStunned(local),
+            IsKnockbackActive: knockbackActive,
+            PhysicalControlDown: physicalControlDown,
+            ReleaseObserved: !physicalControlDown,
+            TerritoryMatches: territoryMatches,
+            InstanceMatches: instanceMatches,
+            TargetMatches: targetMatches,
+            ResolvedActionMatches: profileMatches,
+            BindingMatches: bindingMatches,
+            PluginStateMatches: pluginStateMatches,
+            Faulted: faulted);
+        var actionReady = IsTurboSafetySafe(safety)
+            && engine.Pending is null
+            && actionManager != null
+            && !actionManager->ActionQueued
+            && actionManager->AnimationLock <= AnimationLockEpsilonSeconds
+            && actionManager->IsActionOffCooldown(runtime.Candidate.ActionType, resolvedActionId)
+            && actionManager->GetActionStatus(
+                runtime.Candidate.ActionType,
+                resolvedActionId,
+                runtime.Candidate.TargetId,
+                true,
+                true) == 0;
+        return new TurboObservation(
+            actionManager,
+            bindingMatches ? RaptureHotbarModule.Instance() : null,
+            resolvedActionId,
+            safety,
+            actionReady);
+    }
+
+    private static bool IsTurboSafetySafe(HoldRepeatSafetyState safety) =>
+        safety.Enabled
+        && !safety.ConflictDetected
+        && safety.LoggedIn
+        && safety.IsAlive
+        && !safety.IsMounted
+        && !safety.IsStunned
+        && !safety.IsKnockbackActive
+        && safety.PhysicalControlDown
+        && !safety.ReleaseObserved
+        && safety.TerritoryMatches
+        && safety.InstanceMatches
+        && safety.TargetMatches
+        && safety.ResolvedActionMatches
+        && safety.BindingMatches
+        && safety.PluginStateMatches
+        && !safety.Faulted;
+
+    private static HoldRepeatCancelReason GetTurboCancellationReason(HoldRepeatSafetyState safety)
+    {
+        if (safety.ReleaseObserved || !safety.PhysicalControlDown) return HoldRepeatCancelReason.Released;
+        if (safety.Faulted) return HoldRepeatCancelReason.Fault;
+        if (!safety.Enabled) return HoldRepeatCancelReason.Disabled;
+        if (safety.ConflictDetected) return HoldRepeatCancelReason.Conflict;
+        if (!safety.LoggedIn) return HoldRepeatCancelReason.Logout;
+        if (!safety.IsAlive) return HoldRepeatCancelReason.Death;
+        if (safety.IsMounted) return HoldRepeatCancelReason.Mounted;
+        if (safety.IsStunned) return HoldRepeatCancelReason.Stun;
+        if (safety.IsKnockbackActive) return HoldRepeatCancelReason.Knockback;
+        if (!safety.PluginStateMatches) return HoldRepeatCancelReason.PluginChange;
+        if (!safety.TerritoryMatches) return HoldRepeatCancelReason.TerritoryChange;
+        if (!safety.InstanceMatches) return HoldRepeatCancelReason.InstanceChange;
+        if (!safety.TargetMatches) return HoldRepeatCancelReason.TargetChange;
+        if (!safety.ResolvedActionMatches) return HoldRepeatCancelReason.ResolvedActionChange;
+        if (!safety.BindingMatches) return HoldRepeatCancelReason.BindingChange;
+        return HoldRepeatCancelReason.Fault;
+    }
+
+    private bool TryReadCurrentSlotIdentity(
+        CertifiedHotbarPress press,
+        out HotbarSlotIdentity identity)
+    {
+        identity = default;
+        var hotbarModule = RaptureHotbarModule.Instance();
+        if (hotbarModule == null) return false;
+        var slot = hotbarModule->GetSlotById(press.Binding.HotbarId, press.Binding.SlotId);
+        var captured = CaptureHotbarSlotIdentity(press, slot);
+        if (captured is not { } value) return false;
+        identity = value;
+        return true;
+    }
+
+    private static HotbarSlotIdentity? CaptureHotbarSlotIdentity(
+        CertifiedHotbarPress? press,
+        RaptureHotbarModule.HotbarSlot* slot)
+    {
+        if (press is not { } certified || slot == null) return null;
+        var commandType = (uint)slot->CommandType;
+        var commandId = slot->CommandId;
+        if (commandId == 0
+            || commandType != DirectActionHotbarSlotType)
+        {
+            return null;
+        }
+
+        var controlFingerprint = NonZeroFingerprint(
+            (ulong)(int)certified.Binding.InputId,
+            (ulong)(int)certified.PhysicalKey,
+            (ulong)certified.RequiredModifiers,
+            (ulong)certified.ActiveModifiers,
+            certified.KeySettingIndex,
+            certified.Binding.HotbarId,
+            certified.Binding.SlotId,
+            commandType,
+            commandId);
+        return new HotbarSlotIdentity(
+            certified.Binding,
+            commandType,
+            commandId,
+            controlFingerprint);
+    }
+
+    private HoldRepeatOptions CreateTurboOptions() => new HoldRepeatOptions(
+        configuration.TurboInitialDelayMs,
+        configuration.TurboRepeatIntervalMs,
+        HoldRepeatOptions.AbsoluteMaximumHoldMilliseconds).Normalize();
 
     private bool TryReplaceOwnedNativeQueue(
         ActionManager* actionManager,
@@ -785,22 +1431,16 @@ internal sealed unsafe class ActionBufferService : IDisposable
         // Whichever side acquires the gate first has a single, auditable ordering.
         lock (dispatchGate)
         {
-            inputGenerations.Invalidate();
-            engine.Cancel(CancelReason.Conflict);
-            pendingRuntimeAction = null;
+            Cancel(CancelReason.Conflict, "Plugin topology changed");
             nativeQueueOwnership.Clear();
-            lastEvent = "Plugin topology changed";
             Interlocked.Exchange(ref pluginTopologyDirty, 1);
         }
     }
 
     private void MarkCompatibilityProfileDirty(string detail)
     {
-        inputGenerations.Invalidate();
-        engine.Cancel(CancelReason.Conflict);
-        pendingRuntimeAction = null;
+        Cancel(CancelReason.Conflict, $"{detail}; reassessment scheduled");
         nativeQueueOwnership.Clear();
-        lastEvent = $"{detail}; reassessment scheduled";
         Interlocked.Exchange(ref pluginTopologyDirty, 1);
     }
 
@@ -849,7 +1489,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             if (compatibilityQuarantineFrames > 0)
             {
                 compatibilityQuarantineFrames--;
-                if (engine.Pending is not null)
+                if (engine.Pending is not null || turboEngine.Snapshot.HasActiveHold)
                 {
                     Cancel(CancelReason.Conflict, "Compatibility state is settling for one clean frame");
                 }
@@ -860,6 +1500,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             if (engine.Pending is null)
             {
                 pendingRuntimeAction = null;
+                ProcessTurbo(now, frameGap);
                 return;
             }
 
@@ -1130,6 +1771,11 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 }
             }
 
+            if (header->SourceSequence != 0 && casterEntityId == currentLocalEntityId)
+            {
+                TryCompleteTurboAcknowledgement(header);
+            }
+
             if (effects != null && targetEntityIds != null)
             {
                 var targetCount = Math.Min((int)header->NumTargets, MaximumActionEffectTargets);
@@ -1143,10 +1789,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
                     lock (dispatchGate)
                     {
-                        inputGenerations.Invalidate();
-                        engine.Cancel(CancelReason.Knockback);
-                        pendingRuntimeAction = null;
-                        lastEvent = "Cleared by a local-player knockback action effect";
+                        Cancel(CancelReason.Knockback, "Cleared by a local-player knockback action effect");
                         Interlocked.Exchange(ref forcedMovementObserved, 1);
                     }
                     break;
@@ -1370,7 +2013,8 @@ internal sealed unsafe class ActionBufferService : IDisposable
             }
         }
 
-        if (activeConflicts.Count > 0 && engine.Pending is not null)
+        if (activeConflicts.Count > 0
+            && (engine.Pending is not null || turboEngine.Snapshot.HasActiveHold))
         {
             lock (dispatchGate)
             {
@@ -1446,6 +2090,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             inputGenerations.Invalidate();
             engine.Cancel(CancelReason.Explicit);
             pendingRuntimeAction = null;
+            CancelTurboUnsafe(HoldRepeatCancelReason.Fault, $"Faulted: {context}");
             nativeQueueOwnership.Clear();
             lastEvent = $"Faulted: {context}";
             if (!faultLogged)
@@ -1454,6 +2099,160 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 log.Error(exception, "PulseQueue faulted closed: {Context}. Reload or explicitly reset before buffering resumes.", context);
             }
         }
+    }
+
+    private void CancelTurboUnsafe(HoldRepeatCancelReason reason, string detail)
+    {
+        if (reason == HoldRepeatCancelReason.None) reason = HoldRepeatCancelReason.InputLost;
+        var hadActiveHold = turboEngine.Snapshot.HasActiveHold;
+        turboEngine.Cancel(reason);
+        turboRuntime = null;
+        Interlocked.Exchange(ref turboAcknowledgement, null);
+        turboLastCancelReason = reason;
+        lastEvent = detail;
+        if (hadActiveHold && configuration.DetailedLogging)
+        {
+            log.Information("Turbo cancelled: {Reason}. {Detail}", reason, detail);
+        }
+    }
+
+    private static HoldRepeatCancelReason ToTurboCancelReason(CancelReason reason) => reason switch
+    {
+        CancelReason.Replaced => HoldRepeatCancelReason.Replaced,
+        CancelReason.Disabled => HoldRepeatCancelReason.Disabled,
+        CancelReason.Conflict => HoldRepeatCancelReason.Conflict,
+        CancelReason.Logout => HoldRepeatCancelReason.Logout,
+        CancelReason.Death => HoldRepeatCancelReason.Death,
+        CancelReason.Mounted => HoldRepeatCancelReason.Mounted,
+        CancelReason.Stun => HoldRepeatCancelReason.Stun,
+        CancelReason.Knockback => HoldRepeatCancelReason.Knockback,
+        CancelReason.TerritoryChange => HoldRepeatCancelReason.TerritoryChange,
+        CancelReason.InstanceChange => HoldRepeatCancelReason.InstanceChange,
+        CancelReason.TargetChange => HoldRepeatCancelReason.TargetChange,
+        CancelReason.ResolvedActionChange => HoldRepeatCancelReason.ResolvedActionChange,
+        CancelReason.ServerRejected => HoldRepeatCancelReason.PulseRejected,
+        CancelReason.Expired => HoldRepeatCancelReason.InputLost,
+        CancelReason.NonTransientFailure or CancelReason.Ineligible => HoldRepeatCancelReason.ResolvedActionChange,
+        _ => HoldRepeatCancelReason.InputLost,
+    };
+
+    private void RejectTurboPulseUnsafe(string detail)
+    {
+        turboRejectedCount++;
+        CancelTurboUnsafe(
+            HoldRepeatCancelReason.PulseRejected,
+            $"{detail}; hold ended without retry");
+    }
+
+    private bool BeginTurboAcknowledgement(
+        TurboRuntime runtime,
+        HoldRepeatPulseToken pulse,
+        TurboAcknowledgementSequenceMode sequenceMode,
+        ushort sequenceMarker,
+        ExactActionTuple exactTuple)
+    {
+        var expectation = new TurboActionEffectExpectation(
+            exactTuple.ActionType,
+            exactTuple.RequestedActionId,
+            exactTuple.ResolvedActionId,
+            sequenceMode,
+            sequenceMarker);
+        if (!expectation.IsValid
+            || !pulse.IsValid
+            || !turboEngine.IsTokenCurrent(pulse)
+            || !ReferenceEquals(turboRuntime, runtime))
+        {
+            return false;
+        }
+
+        var acknowledgement = new TurboAcknowledgement(
+            runtime,
+            pulse,
+            expectation,
+            NowMilliseconds);
+        return Interlocked.CompareExchange(ref turboAcknowledgement, acknowledgement, null) is null;
+    }
+
+    private void TryCompleteTurboAcknowledgement(ActionEffectHandler.Header* header)
+    {
+        if (header == null) return;
+        lock (dispatchGate)
+        {
+            var acknowledgement = Volatile.Read(ref turboAcknowledgement);
+            if (acknowledgement is null
+                || !ReferenceEquals(turboRuntime, acknowledgement.Runtime)
+                || !turboEngine.IsTokenCurrent(acknowledgement.Pulse)
+                || Volatile.Read(ref latestCertifiedPressId) != acknowledgement.Pulse.PressId)
+            {
+                return;
+            }
+
+            var observation = new TurboActionEffectObservation(
+                header->ActionType,
+                header->ActionId,
+                header->SourceSequence);
+            if (!TurboActionEffectAcknowledgementMatcher.Matches(
+                    acknowledgement.Expectation,
+                    observation))
+            {
+                if (configuration.DetailedLogging)
+                {
+                    log.Debug(
+                        "Turbo acknowledgement ignored: expected type={ExpectedType}, action={Requested}/{Resolved}, mode={Mode}, marker={Marker}; observed type={ObservedType}, action={ObservedAction}, spell={ObservedSpell}, sequence={ObservedSequence}.",
+                        acknowledgement.Expectation.ActionType,
+                        acknowledgement.Expectation.RequestedActionId,
+                        acknowledgement.Expectation.ResolvedActionId,
+                        acknowledgement.Expectation.SequenceMode,
+                        acknowledgement.Expectation.SequenceMarker,
+                        header->ActionType,
+                        header->ActionId,
+                        header->SpellId,
+                        header->SourceSequence);
+                }
+
+                return;
+            }
+
+            if (!ReferenceEquals(
+                    Interlocked.CompareExchange(ref turboAcknowledgement, null, acknowledgement),
+                    acknowledgement))
+            {
+                return;
+            }
+
+            if (configuration.DetailedLogging)
+            {
+                log.Information(
+                    "Turbo acknowledgement action={Action}, spell={Spell}, type={Type}, sequence={Sequence}, pulse={Hold}/{Ordinal}.",
+                    header->ActionId,
+                    header->SpellId,
+                    header->ActionType,
+                    header->SourceSequence,
+                    acknowledgement.Pulse.HoldId,
+                    acknowledgement.Pulse.Ordinal);
+            }
+        }
+    }
+
+    private string DescribeTurboState()
+    {
+        if (!configuration.TurboEnabled) return "Off (opt-in)";
+        if (physicalHotbarInput is null)
+        {
+            return $"Unavailable - {turboInputUnavailableReason}";
+        }
+
+        if (!configuration.Enabled) return "Off - PulseQueue is disabled";
+        if (configuration.DryRun) return "Paused - dry run never emits Turbo pulses";
+        if (activeConflicts.Count > 0) return "Suspended - resolve the compatibility conflict";
+        if (Volatile.Read(ref turboAcknowledgement) is not null) return "Holding - waiting for the last exact action acknowledgement";
+        return turboEngine.Snapshot.State switch
+        {
+            HoldRepeatState.Active when turboRuntime is { } runtime =>
+                $"Holding hotbar {runtime.SlotIdentity.Binding.HotbarId + 1}, slot {runtime.SlotIdentity.Binding.SlotId + 1}",
+            HoldRepeatState.NeedsRelease => "Ready for a fresh physical key press",
+            _ => "Ready - no held keyboard slot",
+        };
     }
 
     private RuntimeState GetRuntimeState()
@@ -1513,6 +2312,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
         return hash;
     }
 
+    private static ulong NonZeroFingerprint(params ulong[] values)
+    {
+        var value = Fingerprint(values);
+        return value == 0 ? 1UL : value;
+    }
+
     private nint FindTargetAddress(ulong targetId)
     {
         if (targetId is 0 or InvalidObjectId) return nint.Zero;
@@ -1548,11 +2353,70 @@ internal sealed unsafe class ActionBufferService : IDisposable
         double InitialTemporalRemainderMilliseconds,
         long ExpiresAtMilliseconds);
 
-    private sealed class HotbarInputScope(long generation)
+    private sealed class HotbarInputScope(
+        long generation,
+        CertifiedHotbarPress? certifiedPress,
+        HotbarSlotIdentity? slotIdentity)
     {
         public long Generation { get; } = generation;
 
+        public CertifiedHotbarPress? CertifiedPress { get; } = certifiedPress;
+
+        public HotbarSlotIdentity? SlotIdentity { get; } = slotIdentity;
+
         public bool MaySupersedeOwnedQueue { get; set; }
+
+        public int ActionInvocationCount { get; set; }
+
+        public bool TurboDisqualified { get; set; }
+
+        public Candidate? TurboCandidate { get; set; }
+    }
+
+    private readonly record struct HotbarSlotIdentity(
+        StandardHotbarBinding Binding,
+        uint CommandType,
+        uint CommandId,
+        ulong ControlFingerprint);
+
+    private sealed record TurboRuntime(
+        CertifiedHotbarPress Press,
+        HotbarSlotIdentity SlotIdentity,
+        Candidate Candidate,
+        string CompatibilitySignature,
+        HoldRepeatStartRequest StartRequest);
+
+    private sealed record TurboAcknowledgement(
+        TurboRuntime Runtime,
+        HoldRepeatPulseToken Pulse,
+        TurboActionEffectExpectation Expectation,
+        long StartedAtMilliseconds);
+
+    private readonly struct TurboObservation
+    {
+        public TurboObservation(
+            ActionManager* actionManager,
+            RaptureHotbarModule* hotbarModule,
+            uint resolvedActionId,
+            HoldRepeatSafetyState safety,
+            bool actionReady)
+        {
+            ActionManager = actionManager;
+            HotbarModule = hotbarModule;
+            ResolvedActionId = resolvedActionId;
+            Safety = safety;
+            ActionReady = actionReady;
+        }
+
+        public ActionManager* ActionManager { get; }
+
+        public RaptureHotbarModule* HotbarModule { get; }
+
+        public uint ResolvedActionId { get; }
+
+        public HoldRepeatSafetyState Safety { get; }
+
+        public bool ActionReady { get; }
     }
 
     private sealed record Snapshot(

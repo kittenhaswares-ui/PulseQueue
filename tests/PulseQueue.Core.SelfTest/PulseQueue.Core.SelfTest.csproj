@@ -8,5 +8,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/PulseQueue.Core/PulseQueue.Core.csproj" />
+    <Compile Include="../../src/PulseQueue.Plugin/Models/PluginConfiguration.cs" Link="PluginConfiguration.cs" />
   </ItemGroup>
 </Project>

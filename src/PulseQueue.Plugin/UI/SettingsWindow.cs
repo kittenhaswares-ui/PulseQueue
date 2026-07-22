@@ -25,7 +25,7 @@ internal sealed class SettingsWindow : Window
         this.apply = apply;
         this.reset = reset;
 
-        Size = new Vector2(570, 690);
+        Size = new Vector2(610, 790);
         SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints
         {
@@ -39,18 +39,53 @@ internal sealed class SettingsWindow : Window
         var diagnostics = actionBuffer.Diagnostics;
 
         ImGui.TextColored(new Vector4(0.42f, 0.84f, 1f, 1f), "PulseQueue");
-        ImGui.TextWrapped("A strict, one-shot buffer for direct hotbar actions that vanilla rejected only because a GCD/local recast or animation lock was about to end.");
+        ImGui.TextWrapped("A strict smart buffer plus an optional same-slot Turbo source for direct keyboard hotbar actions.");
         ImGui.Spacing();
 
         DrawStatus(diagnostics);
         ImGui.Separator();
 
-        DrawCheckbox("Enable smart buffer", configuration.Enabled, value => configuration.Enabled = value);
-        DrawCheckbox("Dry run (detect, never replay)", configuration.DryRun, value => configuration.DryRun = value);
+        DrawCheckbox("Enable PulseQueue", configuration.Enabled, value => configuration.Enabled = value);
+        DrawCheckbox("Dry run (detect only; Turbo pauses)", configuration.DryRun, value => configuration.DryRun = value);
         DrawCheckbox("Detailed Dalamud logging", configuration.DetailedLogging, value => configuration.DetailedLogging = value);
 
+        ImGui.Separator();
+        ImGui.TextUnformatted("Native Turbo (experimental)");
+        ImGui.TextWrapped("Hold one physical keyboard-bound standard-hotbar action. After the initial delay, PulseQueue invokes only that same slot at the bounded interval while the action is genuinely ready.");
+        if (configuration.Version > PluginConfiguration.CurrentVersion)
+        {
+            ImGui.TextColored(
+                new Vector4(1f, 0.55f, 0.3f, 1f),
+                "Turbo is locked off because this settings file belongs to a newer PulseQueue version.");
+            ImGui.TextWrapped("Keep it untouched for downgrade safety, or use Reset settings only if you deliberately want to replace it with this version's defaults.");
+        }
+        else
+        {
+            DrawCheckbox("Enable native Turbo", configuration.TurboEnabled, value => configuration.TurboEnabled = value);
+            DrawSlider(
+                "Initial delay (ms)",
+                configuration.TurboInitialDelayMs,
+                PluginConfiguration.MinimumTurboInitialDelayMilliseconds,
+                PluginConfiguration.MaximumTurboInitialDelayMilliseconds,
+                value => configuration.TurboInitialDelayMs = value);
+            DrawSlider(
+                "Repeat interval (ms)",
+                configuration.TurboRepeatIntervalMs,
+                PluginConfiguration.MinimumTurboRepeatIntervalMilliseconds,
+                PluginConfiguration.MaximumTurboRepeatIntervalMilliseconds,
+                value => configuration.TurboRepeatIntervalMs = value);
+            DrawCheckbox(
+                "Allow Turbo outside combat",
+                configuration.TurboOutOfCombat,
+                value => configuration.TurboOutOfCombat = value);
+        }
+        ImGui.TextWrapped($"Turbo: {diagnostics.TurboStatus}");
+        ImGui.TextDisabled("Testing scope: exact keyboard chord on direct standard-hotbar Action slots; one instant, non-ground, non-movement Action/PvPAction invocation only. PvPCombo, macros, items, mouse, controller, cross-hotbar, and plugin-originated input cannot own Turbo.");
+        ImGui.TextDisabled("Effective cadence also waits for the previous action acknowledgement. Missing acknowledgement stops the hold after 2 s; every hold stops after 30 s.");
+        ImGui.TextDisabled("ReAction Turbo Hotbars must be off. NoClippy may stay on and remains the sole animation-lock owner.");
+
         ImGui.Spacing();
-        if (ImGui.Button("Clear pending input"))
+        if (ImGui.Button("Clear pending input and stop Turbo"))
         {
             actionBuffer.Cancel(PulseQueue.Core.CancelReason.Explicit, "Cleared from settings");
         }
@@ -60,8 +95,9 @@ internal sealed class SettingsWindow : Window
 
         ImGui.Separator();
         ImGui.TextUnformatted("Hard safety contract");
-        ImGui.BulletText("The original player action is sent first; at most that exact tuple can be replayed once.");
-        ImGui.BulletText("No action substitution, target selection, target change, retry, loop, or lock/recast mutation.");
+        ImGui.BulletText("Smart buffer: the original player action is sent first; at most that exact tuple can be replayed once.");
+        ImGui.BulletText("Turbo: one held key may execute multiple actions, but only through its exact owned slot and bounded cadence.");
+        ImGui.BulletText("No automatic action or target selection, target change, immediate rejection retry, or lock/recast mutation.");
         ImGui.BulletText("A newer hotbar action replaces the old token.");
         ImGui.BulletText("It may clear one exact older native queue entry only when ownership is proven and the newer eligible action is ready or inside the hold window.");
         ImGui.BulletText("Death, stun, forced movement, target/resolver/context/zone change, frame stall, or native queue activity clears it.");
@@ -82,6 +118,8 @@ internal sealed class SettingsWindow : Window
         ImGui.TextUnformatted($"Native queue accepted / blocked: {diagnostics.NativeQueueAccepted} / {diagnostics.NativeQueueBlocked}");
         ImGui.TextUnformatted($"Owned native queues replaced by newer input: {diagnostics.OwnedNativeQueueReplacements}");
         ImGui.TextUnformatted($"MOAction exclusions observed: {diagnostics.IntegrationExclusions} ({diagnostics.ExcludedIntegrationActions} configured IDs)");
+        ImGui.TextUnformatted($"Turbo starts / pulses / accepted / rejected: {diagnostics.TurboStarts} / {diagnostics.TurboPulses} / {diagnostics.TurboAccepted} / {diagnostics.TurboRejected}");
+        ImGui.TextUnformatted($"Turbo state / last cancellation: {diagnostics.TurboState} / {diagnostics.TurboLastCancelReason}");
         ImGui.TextUnformatted($"Last cancellation: {diagnostics.LastCancelReason}");
         ImGui.TextWrapped($"Last event: {diagnostics.LastEvent}");
 
@@ -119,6 +157,19 @@ internal sealed class SettingsWindow : Window
     {
         var value = current;
         if (!ImGui.Checkbox(label, ref value)) return;
+        assign(value);
+        apply($"{label} changed");
+    }
+
+    private void DrawSlider(
+        string label,
+        int current,
+        int minimum,
+        int maximum,
+        Action<int> assign)
+    {
+        var value = current;
+        if (!ImGui.SliderInt(label, ref value, minimum, maximum)) return;
         assign(value);
         apply($"{label} changed");
     }

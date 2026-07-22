@@ -59,7 +59,7 @@ public sealed class Plugin : IDalamudPlugin
 
         commandManager.AddHandler(Command, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open PulseQueue settings. Subcommands: on, off, status, dry on|off, log on|off, cancel, reset, help.",
+            HelpMessage = "Open PulseQueue settings. Subcommands: on, off, status, turbo on|off, dry on|off, log on|off, cancel, reset, help.",
         });
 
         pluginInterface.UiBuilder.Draw += Draw;
@@ -123,13 +123,24 @@ public sealed class Plugin : IDalamudPlugin
                 configuration.DryRun = dryRun;
                 ApplyConfiguration($"Dry run {(dryRun ? "enabled" : "disabled")}");
                 break;
+            case "turbo" when TryReadToggle(words, out var turbo):
+                if (configuration.Version > PluginConfiguration.CurrentVersion)
+                {
+                    chatGui.PrintError(
+                        "[PulseQueue] Native Turbo remains off because this configuration was written by a newer plugin. Update PulseQueue or use Reset only if you intentionally want to replace that newer configuration.");
+                    break;
+                }
+
+                configuration.TurboEnabled = turbo;
+                ApplyConfiguration($"Native Turbo {(turbo ? "enabled" : "disabled")}");
+                break;
             case "log" when TryReadToggle(words, out var detailedLogging):
                 configuration.DetailedLogging = detailedLogging;
                 ApplyConfiguration($"Detailed logging {(detailedLogging ? "enabled" : "disabled")}");
                 break;
             case "cancel":
                 actionBuffer.Cancel(CancelReason.Explicit, "Cancelled by command");
-                chatGui.Print("[PulseQueue] Pending input cleared.");
+                chatGui.Print("[PulseQueue] Pending input cleared and Turbo stopped.");
                 break;
             case "reset":
                 ResetConfiguration();
@@ -168,12 +179,13 @@ public sealed class Plugin : IDalamudPlugin
             + $"captured={value.Captured}, dispatched={value.Dispatched}, rejected={value.ReplayRejected}; "
             + $"inputs={value.ObservedHotbarInputs}, replaced={value.ReplacedPendingInputs}; "
             + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} owned-replaced; "
+            + $"turbo={value.TurboState} {value.TurboPulses}/{value.TurboAccepted}/{value.TurboRejected}, {value.TurboStatus}; "
             + $"integrations={integrations}; conflicts={conflicts}; last={value.LastEvent}");
     }
 
     private void PrintHelp(bool error = false)
     {
-        const string text = "Usage: /pulsequeue [on|off|status|dry on|off|log on|off|cancel|reset|help]. /pulsequeue opens settings.";
+        const string text = "Usage: /pulsequeue [on|off|status|turbo on|off|dry on|off|log on|off|cancel|reset|help]. /pulsequeue opens settings.";
         if (error) chatGui.PrintError($"[PulseQueue] {text}");
         else chatGui.Print($"[PulseQueue] {text}");
     }

@@ -1,14 +1,19 @@
 # PulseQueue
 
-PulseQueue is a conservative one-shot smart input buffer for Final Fantasy XIV.
-If a direct hotbar action is pressed a little too early and vanilla FFXIV rejects
-it only because of a short GCD/local recast or animation lock, PulseQueue can
+PulseQueue is a conservative smart input buffer for Final Fantasy XIV. If a
+direct hotbar action is pressed a little too early and vanilla FFXIV rejects it
+only because of a short GCD/local recast or animation lock, PulseQueue can
 retain that exact action briefly and submit it once when the client reports it
 ready. This includes the intended PvP Guard cooldown-edge use case.
 
+Version 0.3 also contains an optional native same-slot repeat mode for a tightly
+limited keyboard testing scope. It is disabled by default. Unlike the one-shot
+buffer, holding an eligible key may intentionally execute the same bound slot
+multiple times over the lifetime of that hold.
+
 This is an open testing release, not an official Dalamud plugin.
 
-## Safety contract
+## One-shot buffer safety contract
 
 - One captured hotbar intent can produce at most one replay.
 - Vanilla FFXIV always receives the original press first. An action the game
@@ -22,7 +27,8 @@ This is an open testing release, not an official Dalamud plugin.
   wins; PulseQueue does not maintain a FIFO weave backlog or a skill-priority
   list.
 - There is no alternative-action selection, target selection, target fallback,
-  key repeat, automatic retry, or retry after a server rejection.
+  automatic retry, or retry after a server rejection. The one-shot buffer does
+  not generate key repeat; the separate opt-in Turbo source is described below.
 - The token is consumed before one queue-mode call. Its result is never fed
   back into another attempt, so a failed replay is terminal.
 - The hard lifetime cap is 180 ms. Latency detection may shorten that window but
@@ -37,18 +43,52 @@ This is an open testing release, not an official Dalamud plugin.
   entry came from an older certified hotbar input and the newer eligible action
   is ready or inside the learned hold window. Foreign queues are never cleared.
 
+## Native Turbo safety contract
+
+- Turbo is opt-in and defaults off. Its default initial delay is 180 ms, its
+  default repeat interval is 80 ms, and out-of-combat operation defaults off.
+- Only physical keyboard bindings that resolve to a standard hotbar slot can
+  become an owner. The Turbo testing scope accepts direct `Action` slots whose
+  single observed invocation is an `Action` or `PvPAction`. `PvPCombo` slots
+  remain excluded until their route identity can be proven end to end.
+- Macros, items, mouse clicks, controller and cross-hotbar input, every
+  cast-time/ground-target/player-movement action, and calls originating from
+  another plugin never start native Turbo ownership.
+- A held eligible slot may execute multiple actions. Every repeat invokes only
+  that same slot; PulseQueue does not choose another skill or target and does
+  not create a FIFO rotation.
+- Releasing the exact owning key/chord cancels it. A newer certified physical
+  edge preempts an older hold before the newer slot executes. Any newer native
+  hotbar/action invocation also cancels the old hold even when the new input
+  cannot become a Turbo owner; the older key never resumes automatically.
+- After a Turbo pulse is sent, another pulse is blocked until a local-player
+  action effect matches its exact action type, requested/resolved ID, and
+  immediate or queue-relative source sequence. A locally rejected pulse or a
+  missing acknowledgement ends the hold without retry.
+- Every hold has a hard 30-second lifetime and then requires a fresh physical
+  release/press, even if the key remains down.
+- Death, stun, knockback or forced movement, zoning, logout, job/PvP-context
+  change, plugin disable, unsafe compatibility state, and the existing
+  fail-closed safety transitions cancel the active hold.
+- ReAction Turbo Hotbars must remain off. PulseQueue will not run two synthetic
+  repeat sources together.
+- NoClippy remains the only animation-lock correction owner. Native Turbo and
+  the one-shot buffer read the resulting client readiness and never apply a
+  second lock correction.
+
 ## Supported testing scope
 
-Version 0.2 accepts only instant, non-ground-target `Action` and `PvPAction`
+The one-shot buffer accepts only instant, non-ground-target `Action` and `PvPAction`
 attempts reached through the standard or cross hotbar with the normal action
 mode. Macros, items, casts, combo-mode calls, ground placement, mounts, pets,
 duty actions, crafting, player-movement actions, and direct calls from other
 plugins are excluded.
 
-The hotbar scope supports keyboard, mouse, and controller paths that run through
-FFXIV's standard slot executor. It cannot prove that an invocation was a
-physical electrical key event, so the strict guarantee is one certified hotbar
-intent, not one hardware event.
+That one-shot path continues to observe keyboard, mouse, and controller paths
+that run through FFXIV's standard slot executor. The optional native Turbo path
+is narrower: keyboard-bound standard hotbars and direct `Action` slots with one
+exactly correlated `Action`/`PvPAction` invocation only. `PvPCombo`, macros,
+items, mouse, controller, and cross-hotbar input cannot own Turbo.
 
 ## Adaptive timing
 
@@ -67,7 +107,7 @@ Compatibility is deliberately version- and configuration-specific:
 | Plugin | Supported contract |
 |---|---|
 | NoClippy 0.5.0.24 | Supported. NoClippy remains the sole animation-lock correction owner; PulseQueue observes the resulting readiness and never writes animation-lock state. |
-| ReAction 1.3.5.1 | Supported only with **Turbo Hotbars**, **Auto Target**, **Auto Dismount**, and **Camera Relative Directionals off**, plus an empty **Action Stacks** list. ReAction queue adjustments remain authoritative except for the exact older certified queue entry that a newer valid hotbar input explicitly replaces. |
+| ReAction 1.3.5.1 | Supported only with **Turbo Hotbars**, **Auto Target**, **Auto Dismount**, and **Camera Relative Directionals off**, plus an empty **Action Stacks** list. ReAction Turbo must remain off even when PulseQueue native Turbo is enabled, so only one repeat source exists. ReAction queue adjustments remain authoritative except for the exact older certified queue entry that a newer valid hotbar input explicitly replaces. |
 | MOAction 4.10.1 | Supported through its published retargeted-action IPC. Reported retargeted action IDs bypass PulseQueue and continue through MOAction normally. |
 
 Unknown versions, inaccessible configuration, a missing required integration,
@@ -80,6 +120,9 @@ synthetic hotbar invocations with no public provenance marker. At PulseQueue's
 hook boundary they cannot be distinguished safely from a newer physical press;
 leaving Turbo enabled could let an older held weave displace a newly pressed
 heal, Purify, or Guard. PulseQueue will not guess using action priorities.
+PulseQueue's native Turbo instead starts from its own restricted physical
+keyboard ownership boundary and therefore does not make ReAction Turbo safe to
+enable alongside it.
 Auto Dismount is also disabled in the supported profile because ReAction stores
 an action and invokes it later after dismounting. Camera Relative Directionals
 is disabled because a delayed replay cannot safely preserve its original camera
@@ -112,6 +155,8 @@ Use `/pulsequeue` to open the status window. Useful commands:
 /pulsequeue on
 /pulsequeue off
 /pulsequeue status
+/pulsequeue turbo on
+/pulsequeue turbo off
 /pulsequeue dry on
 /pulsequeue dry off
 /pulsequeue log on
@@ -131,18 +176,32 @@ advantages, so this project does not claim eligibility for that repository.
 
 ## Development disclosure
 
-This initial implementation and its review were substantially AI-assisted. The
+This implementation and its review were substantially AI-assisted. The
 repository publishes the complete source, deterministic tests, build scripts,
 release fingerprint, and mandatory live-test matrix so a human maintainer can
 audit and validate every native interaction. No claim of complete human
-in-game validation is made for version 0.2.0.0.
+in-game validation is made for version 0.3.0.0.
+
+The compatibility design was checked against the exact upstream implementations
+used for this testing profile: [NoClippy 0.5.0.24 animation-lock handling](https://github.com/UnknownX7/NoClippy/blob/3f4b37739bbdccd1833b042018b01be84a7d382b/Modules/AnimationLock.cs)
+and [ReAction 1.3.5.1 Turbo Hotbars](https://github.com/UnknownX7/ReAction/blob/9436e0c72c569b5518c67bda2e29f44822c68ea0/Modules/TurboHotbars.cs).
+PulseQueue's implementation is clean-room and uses the public API-15 client
+structures; no source was copied from either project.
+The exact acknowledgement mapping is checked against the locally pinned
+FFXIVClientStructs commit: [`ActionEffectHandler.Header`](https://github.com/aers/FFXIVClientStructs/blob/0ce3f0220901a7c9f16d3fec526558e7829ca3b3/FFXIVClientStructs/FFXIV/Client/Game/Character/ActionEffectHandler.cs)
+provides type/ID/sequence, while [`CastInfo.ResponseActionType` and
+`ResponseActionId`](https://github.com/aers/FFXIVClientStructs/blob/0ce3f0220901a7c9f16d3fec526558e7829ca3b3/FFXIVClientStructs/FFXIV/Client/Game/Character/CastInfo.cs)
+use the native `ActionType` and action-ID domains matched by PulseQueue.
 
 ## Validation status
 
-The dependency-free state machine and runtime safety helpers are covered by 65
-deterministic invariant tests, including a seeded 10,000-step adversarial trace,
-exact native-queue classification, newest-generation replacement, mounted
-cancellation, and a concurrent consume race.
+The dependency-free state machines and runtime safety helpers have deterministic
+invariant coverage, including a seeded adversarial trace, exact native-queue
+classification, newest-generation replacement, mounted cancellation, a
+concurrent consume race, and terminal rejection of a Turbo pulse. The packaged
+0.3 artifact is deliberately testing-exclusive; physical ownership, key-up,
+same-slot cadence, acknowledgement, and every Turbo transition remain explicit
+live-test gates rather than claimed results.
 The native integration must additionally pass the live matrix in
 [`docs/LIVE_TEST_MATRIX.md`](docs/LIVE_TEST_MATRIX.md) on the current FFXIV
 patch before this testing flag can be removed. Until that evidence exists, do

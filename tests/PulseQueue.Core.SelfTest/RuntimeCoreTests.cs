@@ -26,6 +26,10 @@ internal static class RuntimeCoreTests
         yield return ("new buffer intent replaces the older intent", NewIntentReplacesOlderIntent);
         yield return ("mounted state cancels the runtime buffer", MountedStateCancelsRuntimeBuffer);
         yield return ("racing buffer evaluations dispatch exactly once", RacingEvaluationsDispatchExactlyOnce);
+        yield return ("Turbo immediate acknowledgement matches exact action identity", TurboImmediateAcknowledgementMatchesExactIdentity);
+        yield return ("Turbo queued acknowledgement uses wrap-safe sequence ordering", TurboQueuedAcknowledgementUsesWrapSafeOrdering);
+        yield return ("Turbo acknowledgement rejects mismatched action identity", TurboAcknowledgementRejectsMismatchedActionIdentity);
+        yield return ("Turbo acknowledgement fails closed for missing or invalid fields", TurboAcknowledgementFailsClosedForInvalidFields);
     }
 
     private static void ImmediateActionIsAccepted()
@@ -272,6 +276,123 @@ internal static class RuntimeCoreTests
         Equal(CancelReason.Mounted, decision.Reason);
         False(engine.Pending.HasValue);
     }
+
+    private static void TurboImmediateAcknowledgementMatchesExactIdentity()
+    {
+        var expectation = ImmediateTurboExpectation(sequence: 42);
+
+        True(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            new TurboActionEffectObservation(
+                AttemptedAction.ActionType,
+                AttemptedAction.RequestedActionId,
+                SourceSequence: 42)));
+        True(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            new TurboActionEffectObservation(
+                AttemptedAction.ActionType,
+                AttemptedAction.ResolvedActionId,
+                SourceSequence: 42)));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            new TurboActionEffectObservation(
+                AttemptedAction.ActionType,
+                AttemptedAction.ResolvedActionId,
+                SourceSequence: 43)));
+    }
+
+    private static void TurboQueuedAcknowledgementUsesWrapSafeOrdering()
+    {
+        var expectation = QueuedTurboExpectation(baseline: 65_534);
+
+        True(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 65_535)));
+        True(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 1)));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 65_534)));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 32_766)));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 65_533)));
+
+        True(TurboActionEffectAcknowledgementMatcher.IsWrapSafeNewer(1, 65_534));
+        False(TurboActionEffectAcknowledgementMatcher.IsWrapSafeNewer(32_769, 1));
+    }
+
+    private static void TurboAcknowledgementRejectsMismatchedActionIdentity()
+    {
+        var expectation = ImmediateTurboExpectation(sequence: 17);
+
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 17) with
+            {
+                ActionType = AttemptedAction.ActionType + 1,
+            }));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            TurboObservation(sourceSequence: 17) with { ActionId = 999 }));
+    }
+
+    private static void TurboAcknowledgementFailsClosedForInvalidFields()
+    {
+        var expectation = ImmediateTurboExpectation(sequence: 21);
+        var observation = TurboObservation(sourceSequence: 21);
+
+        False(TurboActionEffectAcknowledgementMatcher.Matches(null, observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(expectation, null));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(default, observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(expectation, default));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation with { ActionType = 0 }, observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation with { RequestedActionId = 0 }, observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation with { ResolvedActionId = 0 }, observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation with { SequenceMarker = 0 }, observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation with { SequenceMode = (TurboAcknowledgementSequenceMode)99 },
+            observation));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            observation with { ActionType = 0 }));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            observation with { ActionId = 0 }));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            expectation,
+            observation with { SourceSequence = 0 }));
+        False(TurboActionEffectAcknowledgementMatcher.Matches(
+            QueuedTurboExpectation(baseline: 0), observation));
+        False(TurboActionEffectAcknowledgementMatcher.IsWrapSafeNewer(1, 0));
+        False(TurboActionEffectAcknowledgementMatcher.IsWrapSafeNewer(0, 1));
+    }
+
+    private static TurboActionEffectExpectation ImmediateTurboExpectation(ushort sequence) => new(
+        AttemptedAction.ActionType,
+        AttemptedAction.RequestedActionId,
+        AttemptedAction.ResolvedActionId,
+        TurboAcknowledgementSequenceMode.ImmediateExact,
+        sequence);
+
+    private static TurboActionEffectExpectation QueuedTurboExpectation(ushort baseline) => new(
+        AttemptedAction.ActionType,
+        AttemptedAction.RequestedActionId,
+        AttemptedAction.ResolvedActionId,
+        TurboAcknowledgementSequenceMode.QueuedAfterBaseline,
+        baseline);
+
+    private static TurboActionEffectObservation TurboObservation(ushort sourceSequence) => new(
+        AttemptedAction.ActionType,
+        AttemptedAction.ResolvedActionId,
+        sourceSequence);
 
     private static NativeQueueSnapshot SnapshotFor(uint actionId) => new(
         IsQueued: true,

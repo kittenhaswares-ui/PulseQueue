@@ -17,8 +17,16 @@ jobs:
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
-      - name: Test one-shot invariants
-        run: dotnet run --project tests/PulseQueue.Core.SelfTest -c Release
+      - name: Restore core tests in locked mode
+        run: dotnet restore tests/PulseQueue.Core.SelfTest/PulseQueue.Core.SelfTest.csproj --locked-mode
+      - name: Compile core test harness
+        run: dotnet build tests/PulseQueue.Core.SelfTest/PulseQueue.Core.SelfTest.csproj -c Release --no-restore
+      - name: Test one-shot and Turbo invariants
+        run: dotnet run --project tests/PulseQueue.Core.SelfTest/PulseQueue.Core.SelfTest.csproj -c Release --no-build --no-restore
+      - name: Verify core and test formatting
+        run: |
+          dotnet format src/PulseQueue.Core/PulseQueue.Core.csproj --verify-no-changes --no-restore
+          dotnet format tests/PulseQueue.Core.SelfTest/PulseQueue.Core.SelfTest.csproj --verify-no-changes --no-restore
       - name: Check native safety contract
         shell: pwsh
         run: ./scripts/Verify-SafetyContract.ps1
