@@ -19,7 +19,21 @@ internal static class RuntimeCoreTests
         yield return ("native queue matching requires the complete immutable tuple", QueueMatchingRequiresCompleteTuple);
         yield return ("native outcome rejects a failed action without a queue", FailedActionWithoutQueueIsRejected);
         yield return ("only a newer generation can take an owned native queue", OnlyNewerGenerationCanTakeOwnedQueue);
+        yield return ("exact current native queue can be taken without a newer generation", ExactCurrentQueueCanBeTakenWithoutNewerGeneration);
+        yield return ("terminal cutoff preserves a newer owned native queue", TerminalCutoffPreservesNewerOwnedQueue);
+        yield return ("temporarily hidden native queue preserves exact-take ownership", TemporarilyHiddenQueuePreservesExactTakeOwnership);
+        yield return ("foreign visible native queue invalidates exact-take ownership", ForeignVisibleQueueInvalidatesExactTakeOwnership);
+        yield return ("changed sequence invalidates exact-take ownership", ChangedSequenceInvalidatesExactTakeOwnership);
         yield return ("changed or sent native queues lose ownership", ChangedOrSentQueueLosesOwnership);
+        yield return ("hidden exact drain begin preserves ownership until restore", HiddenExactDrainBeginPreservesOwnershipUntilRestore);
+        yield return ("hidden exact drain identity cannot overlap a lease", HiddenExactDrainIdentityCannotOverlapLease);
+        yield return ("rejected exact drain retains restored queue ownership", RejectedExactDrainRetainsRestoredOwnership);
+        yield return ("completed exact drain consumes a gone queue", CompletedExactDrainConsumesGoneQueue);
+        yield return ("completed exact drain invalidates a foreign visible queue", CompletedExactDrainInvalidatesForeignVisibleQueue);
+        yield return ("completed exact drain invalidates a changed sequence", CompletedExactDrainInvalidatesChangedSequence);
+        yield return ("exact drain lease is non-reentrant and finalizes once", ExactDrainLeaseIsNonReentrantAndFinalizesOnce);
+        yield return ("racing exact drain leases admit exactly one caller", RacingExactDrainLeasesAdmitOneCaller);
+        yield return ("a new queue claim revokes a stale drain lease", NewQueueClaimRevokesStaleDrainLease);
         yield return ("exact owned native queue drain is authorized once", ExactOwnedQueueDrainIsOneShot);
         yield return ("queue drain invocation mode stays separate from stored queue mode", QueueDrainInvocationModeIsSeparate);
         yield return ("stale and foreign drains cannot consume valid ownership", StaleAndForeignDrainsPreserveOwnership);
@@ -157,6 +171,72 @@ internal static class RuntimeCoreTests
         False(ownership.TryTakeForNewerInput(9, 42, queue, out _));
     }
 
+    private static void ExactCurrentQueueCanBeTakenWithoutNewerGeneration()
+    {
+        const uint sequence = 43;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation: 7, sequence, queue);
+
+        True(ownership.TryTakeExactCurrent(7, sequence, queue, out var replaceable));
+        Equal(queue, replaceable);
+        False(ownership.HasOwnership);
+        False(ownership.TryTakeExactCurrent(7, sequence, queue, out _));
+    }
+
+    private static void TerminalCutoffPreservesNewerOwnedQueue()
+    {
+        const uint sequence = 45;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation: 8, sequence, queue);
+
+        False(ownership.TryTakeExactCurrent(7, sequence, queue, out _));
+        True(ownership.HasOwnership);
+        True(ownership.TryTakeExactCurrent(8, sequence, queue, out var replaceable));
+        Equal(queue, replaceable);
+        False(ownership.HasOwnership);
+    }
+
+    private static void TemporarilyHiddenQueuePreservesExactTakeOwnership()
+    {
+        const uint sequence = 47;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation: 8, sequence, queue);
+
+        False(ownership.TryTakeExactCurrent(
+            maximumGeneration: 8,
+            sequenceMarker: sequence + 1,
+            NativeQueueSnapshot.Empty,
+            out _));
+        True(ownership.HasOwnership);
+
+        True(ownership.TryTakeExactCurrent(8, sequence, queue, out var restored));
+        Equal(queue, restored);
+        False(ownership.HasOwnership);
+    }
+
+    private static void ForeignVisibleQueueInvalidatesExactTakeOwnership()
+    {
+        const uint sequence = 53;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation: 9, sequence, queue);
+        var foreign = SnapshotFor(actionId: 999);
+
+        False(ownership.TryTakeExactCurrent(9, sequence, foreign, out _));
+        False(ownership.HasOwnership);
+        False(ownership.TryTakeExactCurrent(9, sequence, queue, out _));
+    }
+
+    private static void ChangedSequenceInvalidatesExactTakeOwnership()
+    {
+        const uint sequence = 59;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation: 10, sequence, queue);
+
+        False(ownership.TryTakeExactCurrent(10, sequence + 1, queue, out _));
+        False(ownership.HasOwnership);
+        False(ownership.TryTakeExactCurrent(10, sequence, queue, out _));
+    }
+
     private static void ChangedOrSentQueueLosesOwnership()
     {
         var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
@@ -175,6 +255,241 @@ internal static class RuntimeCoreTests
             queue,
             queue,
             AttemptedAction));
+    }
+
+    private static void RejectedExactDrainRetainsRestoredOwnership()
+    {
+        const long generation = 13;
+        const uint sequence = 73;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var lease));
+        True(lease.IsValid);
+        True(ownership.HasOwnership);
+
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipRetained,
+            ownership.CompleteExactDrain(lease, sequence, queue));
+        True(ownership.HasOwnership);
+        True(ownership.TryTakeForNewerInput(generation + 1, sequence, queue, out var replaceable));
+        Equal(queue, replaceable);
+        False(ownership.HasOwnership);
+    }
+
+    private static void HiddenExactDrainBeginPreservesOwnershipUntilRestore()
+    {
+        const long generation = 12;
+        const uint sequence = 71;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        False(ownership.TryBeginExactDrain(
+            generation,
+            sequence + 1,
+            NativeQueueSnapshot.Empty,
+            AttemptedAction,
+            out var hiddenLease));
+        False(hiddenLease.IsValid);
+        True(ownership.HasOwnership);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var restoredLease));
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipRetained,
+            ownership.CompleteExactDrain(restoredLease, sequence, queue));
+        True(ownership.HasOwnership);
+    }
+
+    private static void HiddenExactDrainIdentityCannotOverlapLease()
+    {
+        const long generation = 23;
+        const uint sequence = 113;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.CanDeferExactHiddenDrain(generation, AttemptedAction));
+        False(ownership.CanDeferExactHiddenDrain(generation + 1, AttemptedAction));
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var lease));
+        False(ownership.CanDeferExactHiddenDrain(generation, AttemptedAction));
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipRetained,
+            ownership.CompleteExactDrain(lease, sequence, queue));
+        True(ownership.CanDeferExactHiddenDrain(generation, AttemptedAction));
+        True(ownership.TryTakeForNewerInput(generation + 1, sequence, queue, out _));
+        False(ownership.CanDeferExactHiddenDrain(generation, AttemptedAction));
+    }
+
+    private static void CompletedExactDrainConsumesGoneQueue()
+    {
+        const long generation = 14;
+        const uint sequence = 79;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var lease));
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipConsumed,
+            ownership.CompleteExactDrain(lease, sequence, NativeQueueSnapshot.Empty));
+        False(ownership.HasOwnership);
+        Equal(
+            NativeQueueDrainFinalizeResult.InvalidLease,
+            ownership.CompleteExactDrain(lease, sequence, queue));
+    }
+
+    private static void CompletedExactDrainInvalidatesForeignVisibleQueue()
+    {
+        const long generation = 15;
+        const uint sequence = 83;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var foreign = SnapshotFor(actionId: 999);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var lease));
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipInvalidated,
+            ownership.CompleteExactDrain(lease, sequence, foreign));
+        False(ownership.HasOwnership);
+    }
+
+    private static void CompletedExactDrainInvalidatesChangedSequence()
+    {
+        const long generation = 16;
+        const uint sequence = 89;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var lease));
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipInvalidated,
+            ownership.CompleteExactDrain(lease, sequence + 1, queue));
+        False(ownership.HasOwnership);
+    }
+
+    private static void ExactDrainLeaseIsNonReentrantAndFinalizesOnce()
+    {
+        const long generation = 18;
+        const uint sequence = 93;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var lease));
+        False(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var duplicate));
+        False(duplicate.IsValid);
+        False(ownership.TryTakeForNewerInput(generation + 1, sequence, queue, out _));
+        True(ownership.HasOwnership);
+
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipRetained,
+            ownership.CompleteExactDrain(lease, sequence, queue));
+        Equal(
+            NativeQueueDrainFinalizeResult.InvalidLease,
+            ownership.CompleteExactDrain(lease, sequence, NativeQueueSnapshot.Empty));
+        True(ownership.HasOwnership);
+    }
+
+    private static void RacingExactDrainLeasesAdmitOneCaller()
+    {
+        const int contenderCount = 32;
+        const long generation = 20;
+        const uint sequence = 101;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+        using var start = new ManualResetEventSlim(initialState: false);
+        var contenders = Enumerable.Range(0, contenderCount)
+            .Select(_ => Task.Run(() =>
+            {
+                start.Wait();
+                return ownership.TryBeginExactDrain(
+                    generation,
+                    sequence,
+                    queue,
+                    AttemptedAction,
+                    out var lease)
+                        ? lease
+                        : default;
+            }))
+            .ToArray();
+
+        start.Set();
+        Task.WaitAll(contenders);
+
+        Equal(1, contenders.Count(task => task.Result.IsValid));
+        var winner = contenders.Single(task => task.Result.IsValid).Result;
+        Equal(
+            NativeQueueDrainFinalizeResult.OwnershipRetained,
+            ownership.CompleteExactDrain(winner, sequence, queue));
+        True(ownership.HasOwnership);
+    }
+
+    private static void NewQueueClaimRevokesStaleDrainLease()
+    {
+        const long generation = 21;
+        const uint sequence = 103;
+        var queue = SnapshotFor(AttemptedAction.ResolvedActionId);
+        var ownership = ClaimedOwnership(generation, sequence, queue);
+
+        True(ownership.TryBeginExactDrain(
+            generation,
+            sequence,
+            queue,
+            AttemptedAction,
+            out var staleLease));
+        True(ownership.TryClaimNewQueue(
+            generation + 1,
+            sequence + 1,
+            NativeQueueSnapshot.Empty,
+            queue,
+            AttemptedAction));
+        Equal(
+            NativeQueueDrainFinalizeResult.InvalidLease,
+            ownership.CompleteExactDrain(staleLease, sequence, NativeQueueSnapshot.Empty));
+        True(ownership.HasOwnership);
+        True(ownership.TryTakeForNewerInput(
+            generation + 2,
+            sequence + 1,
+            queue,
+            out var replaceable));
+        Equal(queue, replaceable);
     }
 
     private static void ExactOwnedQueueDrainIsOneShot()

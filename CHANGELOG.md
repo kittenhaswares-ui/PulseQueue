@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.3.0 — 2026-07-22
+
+- Fixes the inactive 0.3.2 Turbo behavior seen in the live log: all 111 macro
+  attempts failed the exact-transcript check, three direct owners produced zero
+  pulses, Viper canceled when its adjusted ID changed, and 97/118 ms holds ended
+  before the old 180 ms initial delay.
+- Direct Turbo now re-executes exactly the same certified standard-hotbar slot
+  once per pulse. It keeps the authored slot command fixed, live-resolves the
+  current combo/transformed action (including Viper), permits at most one
+  matching native call, and requires an exact action-effect acknowledgement.
+  A safe direct press may arm even when its initial slot execution emitted no
+  `UseAction` call.
+- Macro Turbo treats static `ActionCount` as a hard maximum rather than an exact
+  observed transcript. Each same-slot epoch may emit zero through that maximum
+  number of independently live-validated action calls, while at most one
+  accepted/queued native outcome may pass; later tail calls are suppressed.
+- A zero-outcome macro epoch is a local no-op and may try the same held slot on
+  the next 60 ms cadence. An accepted direct or macro action requires its exact
+  local action effect; server rejection or a two-second timeout ends ownership
+  without retry.
+- Changes Turbo defaults to 0 ms initial delay and 60 ms repeat interval.
+  Schema 4 migrates only the exact schema-3 180/80 pair and preserves every
+  customized timing pair.
+- Supports NoClippy as the sole animation-lock correction owner. For ReAction,
+  Action Stacks must remain empty and Auto Target, Turbo Hotbars, and Macro Queue
+  must remain off. Auto Dismount and Camera Relative Directionals may remain on
+  because mounted inputs and movement-affecting actions stay excluded/pass-through.
+- Makes every newer certified direct or certified action-only macro hotbar root
+  take priority over an older exact PulseQueue-owned native queue entry,
+  including zero-`UseAction`, not-yet-ready, already-stunned Purify, and
+  forced-movement Guard presses. A visible older entry is cleared before the new
+  slot runs. The unsafe new call remains vanilla and starts no scheduling.
+  Foreign or changed queues remain untouched.
+- Uses a two-phase owned-queue drain so ReAction temporarily hiding and then
+  restoring an unchanged queue after a rejected nested call cannot consume the
+  ownership proof. The opposite hook order defers the exact clear until the
+  restored tuple is visible instead of treating the hidden entry as foreign.
+- Keeps a standalone semantic safety snapshot for every accepted owned queue,
+  even after its one-shot token or Turbo hold has ended. While PulseQueue
+  remains loaded, terminal player, target/resolver, territory/map/instance,
+  job/PvP, movement, and compatibility changes exact-clear only the unchanged
+  owned tuple. Once
+  accepted, that native tuple remains authoritative across later Viper adjusted-
+  ID transformations; ordinary release and physical-original Turbo decline
+  preserve accepted vanilla intent.
+- Documents the full-unload boundary: a currently visible exact owner is
+  cleared before hook disposal, but an outer-hook restoration or asynchronous
+  native outcome that appears afterward cannot be observed or cleared.
+- Leaves the exact at-most-once one-shot buffer and its 180 ms hard cap unchanged.
+
 ## 0.3.2.0 — 2026-07-22
 
 - Reworks the separate, default-off Macro Turbo mode around native macro-slot
