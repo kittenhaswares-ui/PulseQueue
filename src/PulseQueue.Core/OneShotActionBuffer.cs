@@ -252,6 +252,11 @@ public sealed class OneShotActionBuffer
             return BufferClearReason.Dead;
         }
 
+        if (safety.IsMounted)
+        {
+            return BufferClearReason.Mounted;
+        }
+
         if (safety.IsStunned)
         {
             return BufferClearReason.Stunned;

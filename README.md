@@ -17,25 +17,33 @@ This is an open testing release, not an official Dalamud plugin.
   route, hard target, and soft target are immutable while pending. Mouseover
   resolver targets are also bound when an action arrives without a concrete
   target ID and can target something other than self.
-- A new hotbar input cancels the old pending intent before the new input runs.
+- Every newly observed standard/cross-hotbar input invalidates the old pending
+  generation before the new input runs. The newest observed input therefore
+  wins; PulseQueue does not maintain a FIFO weave backlog or a skill-priority
+  list.
 - There is no alternative-action selection, target selection, target fallback,
   key repeat, automatic retry, or retry after a server rejection.
-- The token is consumed before replay. The replay uses the game's non-requeueing
-  queue-execution mode, so a failed replay is terminal.
+- The token is consumed before one queue-mode call. Its result is never fed
+  back into another attempt, so a failed replay is terminal.
 - The hard lifetime cap is 180 ms. Latency detection may shorten that window but
   can never extend it.
-- Death, stun, forced movement, target change, action transformation, native
-  queue activity, logout, job/PvP context change, instance or territory change,
-  a frame stall, plugin disable, or any uncertain state clears the token.
-- PulseQueue never writes animation lock, cooldowns, resources, targets, or the
-  game's native queue fields.
+- Death, stun, forced movement, mounting, target change, action transformation,
+  native queue activity, logout, job/PvP context change, instance or territory
+  change, a frame stall, plugin disable, or any uncertain state clears the
+  token. Actions that move the player are never buffered.
+- PulseQueue never writes animation lock, cooldowns, resources, targets, or any
+  native queue identity field. Its one narrow exception is clearing the queued
+  flag when the complete entry and unchanged action sequence prove that the
+  entry came from an older certified hotbar input and the newer eligible action
+  is ready or inside the learned hold window. Foreign queues are never cleared.
 
 ## Supported testing scope
 
-Version 0.1 accepts only instant, non-ground-target `Action` and `PvPAction`
+Version 0.2 accepts only instant, non-ground-target `Action` and `PvPAction`
 attempts reached through the standard or cross hotbar with the normal action
 mode. Macros, items, casts, combo-mode calls, ground placement, mounts, pets,
-duty actions, crafting, and direct calls from other plugins are excluded.
+duty actions, crafting, player-movement actions, and direct calls from other
+plugins are excluded.
 
 The hotbar scope supports keyboard, mouse, and controller paths that run through
 FFXIV's standard slot executor. It cannot prove that an invocation was a
@@ -52,20 +60,39 @@ actual client readiness is still mandatory before replay.
 
 Timing samples are session-only and never leave the computer.
 
-## Conflicts
+## Compatibility contract
 
-Buffering suspends and clears immediately while any of these loaded plugins is
-detected:
+Compatibility is deliberately version- and configuration-specific:
 
-- NoClippy
-- NoClippyUnchained
-- ReAction
-- ReActionEx
+| Plugin | Supported contract |
+|---|---|
+| NoClippy 0.5.0.24 | Supported. NoClippy remains the sole animation-lock correction owner; PulseQueue observes the resulting readiness and never writes animation-lock state. |
+| ReAction 1.3.5.1 | Supported only with **Turbo Hotbars**, **Auto Target**, **Auto Dismount**, and **Camera Relative Directionals off**, plus an empty **Action Stacks** list. ReAction queue adjustments remain authoritative except for the exact older certified queue entry that a newer valid hotbar input explicitly replaces. |
+| MOAction 4.10.1 | Supported through its published retargeted-action IPC. Reported retargeted action IDs bypass PulseQueue and continue through MOAction normally. |
 
-PulseQueue does not unload, reconfigure, or modify them. ReAction variants can
-replace actions or targets, while NoClippy variants alter the timing layer; the
-v0.1 policy is intentionally fail-closed until a real compatibility matrix has
-been completed.
+Unknown versions, inaccessible configuration, a missing required integration,
+or an unsafe ReAction setting suspends buffering and clears the pending token.
+Plugin load/unload and relevant configuration changes also clear the token and
+require a clean framework frame before capture resumes.
+
+ReAction Turbo Hotbars must be disabled because its held-key calls are
+synthetic hotbar invocations with no public provenance marker. At PulseQueue's
+hook boundary they cannot be distinguished safely from a newer physical press;
+leaving Turbo enabled could let an older held weave displace a newly pressed
+heal, Purify, or Guard. PulseQueue will not guess using action priorities.
+Auto Dismount is also disabled in the supported profile because ReAction stores
+an action and invokes it later after dismounting. Camera Relative Directionals
+is disabled because a delayed replay cannot safely preserve its original camera
+direction across every hook load order. Camera-relative movement actions,
+including ReAction's explicit action 29494 exception, are never buffered.
+
+PulseQueue compares the complete native queue tuple before and after the
+original press; only a new exact matching queue entry is credited to that
+certified hotbar generation. A later eligible certified hotbar input that is
+ready or inside the current hold window may clear that one unchanged owned
+entry so the newest manual input gets its native attempt. Foreign, changed,
+MOAction-owned, or unproven queue state blocks custom capture and is never
+modified.
 
 ## Install
 
@@ -107,13 +134,15 @@ advantages, so this project does not claim eligibility for that repository.
 This initial implementation and its review were substantially AI-assisted. The
 repository publishes the complete source, deterministic tests, build scripts,
 release fingerprint, and mandatory live-test matrix so a human maintainer can
-audit and validate every native interaction. No claim of human in-game
-validation is made for version 0.1.0.0.
+audit and validate every native interaction. No claim of complete human
+in-game validation is made for version 0.2.0.0.
 
 ## Validation status
 
-The dependency-free state machine is covered by 52 deterministic invariant
-tests, including a seeded 10,000-step adversarial trace.
+The dependency-free state machine and runtime safety helpers are covered by 65
+deterministic invariant tests, including a seeded 10,000-step adversarial trace,
+exact native-queue classification, newest-generation replacement, mounted
+cancellation, and a concurrent consume race.
 The native integration must additionally pass the live matrix in
 [`docs/LIVE_TEST_MATRIX.md`](docs/LIVE_TEST_MATRIX.md) on the current FFXIV
 patch before this testing flag can be removed. Until that evidence exists, do
@@ -122,6 +151,7 @@ and release hash are recorded in
 [`docs/VALIDATION_REPORT.md`](docs/VALIDATION_REPORT.md).
 The published ZIP checksum is also stored beside it as
 [`dist/latest.zip.sha256`](dist/latest.zip.sha256).
+Release changes are summarized in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Development
 

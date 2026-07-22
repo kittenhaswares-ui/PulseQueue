@@ -32,6 +32,8 @@ internal sealed record BufferDiagnostics(
     RuntimeState State,
     string Status,
     IReadOnlyList<string> Conflicts,
+    IReadOnlyList<string> Integrations,
+    int ExcludedIntegrationActions,
     int HoldWindowMilliseconds,
     double EstimatedResponseMilliseconds,
     int AcceptedTimingSamples,
@@ -39,6 +41,12 @@ internal sealed record BufferDiagnostics(
     long Dispatched,
     long DryRunDispatches,
     long ReplayRejected,
+    long ObservedHotbarInputs,
+    long ReplacedPendingInputs,
+    long NativeQueueAccepted,
+    long NativeQueueBlocked,
+    long OwnedNativeQueueReplacements,
+    long IntegrationExclusions,
     CancelReason LastCancelReason,
     string LastEvent);
 
@@ -56,20 +64,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private const long MaximumTimingSampleAgeMilliseconds = 2_000;
     private const int MaximumActionEffectTargets = 32;
     private const byte KnockbackActionEffectType = 33;
-
-    private static readonly HashSet<string> IncompatibleInternalNames = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "NoClippy",
-        "NoClippyUnchained",
-        "ReAction",
-        "ReActionEx",
-    };
+    private const int CompatibilityPollIntervalMilliseconds = 500;
+    private const uint ReActionCameraRelativeMovementException = 29494;
 
     [ThreadStatic]
     private static int hotbarExecutionDepth;
 
     [ThreadStatic]
     private static bool replaying;
+
+    [ThreadStatic]
+    private static HotbarInputScope? activeHotbarInput;
 
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly IClientState clientState;
@@ -80,8 +85,11 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private readonly IFramework framework;
     private readonly IPluginLog log;
     private readonly PluginConfiguration configuration;
+    private readonly PluginCompatibilityService compatibility;
     private readonly object dispatchGate = new();
     private readonly BufferEngine engine = new();
+    private readonly InputGenerationGate inputGenerations = new();
+    private readonly NativeQueueOwnership nativeQueueOwnership = new();
     private readonly AdaptiveRttEstimator latency = new(new AdaptiveRttOptions
     {
         MinimumSuggestedHold = TimeSpan.FromMilliseconds(80),
@@ -99,12 +107,23 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
     private RuntimeAction? pendingRuntimeAction;
     private IReadOnlyList<string> activeConflicts = Array.Empty<string>();
+    private IReadOnlyList<string> activeIntegrations = Array.Empty<string>();
+    private IReadOnlySet<uint> excludedIntegrationActionIds = new HashSet<uint>();
+    private string compatibilitySignature = string.Empty;
+    private long nextCompatibilityRefreshAt;
+    private int compatibilityQuarantineFrames;
+    private int pluginTopologyDirty;
     private long lastFrameworkAt;
     private long capturedCount;
     private long dispatchedCount;
     private long dryRunDispatchCount;
     private long replayRejectedCount;
-    private int interruptEpoch;
+    private long nativeQueueAcceptedCount;
+    private long nativeQueueBlockedCount;
+    private long ownedNativeQueueReplacementCount;
+    private long observedHotbarInputCount;
+    private long replacedPendingCount;
+    private long integrationExclusionCount;
     private uint localEntityId;
     private int forcedMovementObserved;
     private int timingHookErrorLogged;
@@ -134,6 +153,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         this.framework = framework;
         this.log = log;
         this.configuration = configuration;
+        compatibility = new PluginCompatibilityService(pluginInterface);
 
         useActionHook = interop.HookFromAddress<ActionManager.Delegates.UseAction>(
             ActionManager.MemberFunctionPointers.UseAction,
@@ -158,6 +178,8 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 state,
                 DescribeState(state),
                 activeConflicts,
+                activeIntegrations,
+                excludedIntegrationActionIds.Count,
                 CurrentHoldWindowMilliseconds,
                 latency.EstimatedRtt.TotalMilliseconds,
                 latency.AcceptedSampleCount,
@@ -165,6 +187,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 dispatchedCount,
                 dryRunDispatchCount,
                 replayRejectedCount,
+                observedHotbarInputCount,
+                replacedPendingCount,
+                nativeQueueAcceptedCount,
+                nativeQueueBlockedCount,
+                ownedNativeQueueReplacementCount,
+                integrationExclusionCount,
                 engine.LastCancelReason,
                 lastEvent);
         }
@@ -173,7 +201,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
     public void Start()
     {
         ObjectDisposedException.ThrowIf(disposed, this);
-        RefreshConflicts();
+        RefreshConflicts(force: true);
         lastFrameworkAt = NowMilliseconds;
         try
         {
@@ -182,10 +210,12 @@ internal sealed unsafe class ActionBufferService : IDisposable
             receiveActionEffectHook.Enable();
             useActionHook.Enable();
             framework.Update += OnFrameworkUpdate;
+            pluginInterface.ActivePluginsChanged += OnActivePluginsChanged;
             log.Information("PulseQueue hooks enabled. Buffer cap is {Cap} ms.", BufferEngine.AbsoluteHoldCapMilliseconds);
         }
         catch
         {
+            pluginInterface.ActivePluginsChanged -= OnActivePluginsChanged;
             framework.Update -= OnFrameworkUpdate;
             DisposeSilently(useActionHook);
             DisposeSilently(receiveActionEffectHook);
@@ -201,7 +231,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         if (reason == CancelReason.None) reason = CancelReason.Explicit;
         lock (dispatchGate)
         {
-            Interlocked.Increment(ref interruptEpoch);
+            inputGenerations.Invalidate();
             engine.Cancel(reason);
             pendingRuntimeAction = null;
             lastEvent = detail;
@@ -219,8 +249,14 @@ internal sealed unsafe class ActionBufferService : IDisposable
     {
         if (disposed) return;
         disposed = true;
+        pluginInterface.ActivePluginsChanged -= OnActivePluginsChanged;
         framework.Update -= OnFrameworkUpdate;
         Cancel(CancelReason.Disabled, "Plugin disposed");
+        lock (dispatchGate)
+        {
+            nativeQueueOwnership.Clear();
+            activeHotbarInput = null;
+        }
         useActionHook.Dispose();
         receiveActionEffectHook.Dispose();
         executeSlotByIdHook.Dispose();
@@ -230,9 +266,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
 
     private byte ExecuteSlotDetour(RaptureHotbarModule* thisPtr, RaptureHotbarModule.HotbarSlot* slot)
     {
-        if (hotbarExecutionDepth == 0 && !replaying)
+        var rootInput = hotbarExecutionDepth == 0 && !replaying;
+        if (rootInput)
         {
-            Cancel(CancelReason.Replaced, "Replaced by a newer hotbar slot execution");
+            BeginHotbarInput();
         }
 
         hotbarExecutionDepth++;
@@ -243,14 +280,19 @@ internal sealed unsafe class ActionBufferService : IDisposable
         finally
         {
             hotbarExecutionDepth--;
+            if (rootInput)
+            {
+                CompleteHotbarInput();
+            }
         }
     }
 
     private byte ExecuteSlotByIdDetour(RaptureHotbarModule* thisPtr, uint hotbarId, uint slotId)
     {
-        if (hotbarExecutionDepth == 0 && !replaying)
+        var rootInput = hotbarExecutionDepth == 0 && !replaying;
+        if (rootInput)
         {
-            Cancel(CancelReason.Replaced, "Replaced by a newer hotbar slot execution");
+            BeginHotbarInput();
         }
 
         hotbarExecutionDepth++;
@@ -261,6 +303,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
         finally
         {
             hotbarExecutionDepth--;
+            if (rootInput)
+            {
+                CompleteHotbarInput();
+            }
         }
     }
 
@@ -282,13 +328,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
         {
             lock (dispatchGate)
             {
-                // Any independent action invocation supersedes a pending token. Only the
-                // certified direct-hotbar subset below may create a replacement token.
-                Cancel(
-                    CancelReason.Replaced,
-                    certifiedHotbarInput
-                        ? "Replaced by a newer hotbar input"
-                        : "Cleared by another native action invocation");
+                // The outer hotbar hook already invalidated the previous generation before
+                // this call. Independent/native invocations still clear it here.
+                if (!certifiedHotbarInput)
+                {
+                    Cancel(CancelReason.Replaced, "Cleared by another native action invocation");
+                }
+
                 if (certifiedHotbarInput)
                 {
                     try
@@ -301,6 +347,48 @@ internal sealed unsafe class ActionBufferService : IDisposable
                             extraParam,
                             mode,
                             comboRouteId);
+                        if (candidate is { } ownershipCandidate
+                            && nativeQueueOwnership.HasOwnership
+                            && !compatibility.IsLiveMOActionUnowned(
+                                ownershipCandidate.RequestedActionId,
+                                ownershipCandidate.ResolvedActionId))
+                        {
+                            MarkCompatibilityProfileDirty("MOAction ownership changed");
+                            candidate = null;
+                        }
+
+                        if (candidate is { } captured
+                            && thisPtr->GetActionStatus(
+                                captured.ActionType,
+                                captured.ResolvedActionId,
+                                captured.TargetId,
+                                false,
+                                false) == 0
+                            && GetTemporalRemainingMilliseconds(
+                                thisPtr,
+                                captured.ActionType,
+                                captured.ResolvedActionId) is var supersedingRemainder
+                            && double.IsFinite(supersedingRemainder)
+                            && supersedingRemainder >= 0
+                            && supersedingRemainder < CurrentHoldWindowMilliseconds)
+                        {
+                            if (activeHotbarInput is { } scope
+                                && scope.Generation == captured.InputGeneration)
+                            {
+                                scope.MaySupersedeOwnedQueue = true;
+                            }
+
+                            if (TryReplaceOwnedNativeQueue(
+                                    thisPtr,
+                                    captured.InputGeneration,
+                                    "before the newest native action call"))
+                            {
+                                candidate = captured with
+                                {
+                                    QueueAtCapture = CaptureNativeQueue(thisPtr),
+                                };
+                            }
+                        }
                     }
                     catch (Exception exception)
                     {
@@ -347,6 +435,83 @@ internal sealed unsafe class ActionBufferService : IDisposable
         return result;
     }
 
+    private void BeginHotbarInput()
+    {
+        var replacedPending = engine.Pending is not null;
+        observedHotbarInputCount++;
+        if (replacedPending) replacedPendingCount++;
+        Cancel(CancelReason.Replaced, "Replaced by the newest hotbar input");
+        activeHotbarInput = new HotbarInputScope(inputGenerations.Current);
+        if (configuration.DetailedLogging)
+        {
+            log.Debug(
+                "Observed hotbar input generation={Generation}, replacedPending={ReplacedPending}.",
+                inputGenerations.Current,
+                replacedPending);
+        }
+    }
+
+    private void CompleteHotbarInput()
+    {
+        var scope = activeHotbarInput;
+        activeHotbarInput = null;
+        if (scope is not { MaySupersedeOwnedQueue: true }) return;
+
+        try
+        {
+            lock (dispatchGate)
+            {
+                if (!inputGenerations.IsCurrent(scope.Generation)) return;
+                var actionManager = ActionManager.Instance();
+                if (actionManager == null) return;
+                TryReplaceOwnedNativeQueue(actionManager, scope.Generation, "after the complete hotbar call");
+            }
+        }
+        catch (Exception exception)
+        {
+            Fault(exception, "Hotbar completion validation failed");
+        }
+    }
+
+    private bool TryReplaceOwnedNativeQueue(
+        ActionManager* actionManager,
+        long replacingGeneration,
+        string phase)
+    {
+        if (actionManager == null) return false;
+        var current = CaptureNativeQueue(actionManager);
+        // ReAction may temporarily hide an older queue around its outer hook and
+        // restore it only after PulseQueue's inner UseAction returns. Preserve
+        // ownership across that empty interval; the full hotbar completion check
+        // sees the stable post-hook state.
+        if (!current.IsQueued) return false;
+        if (!nativeQueueOwnership.TryTakeForNewerInput(
+                replacingGeneration,
+                actionManager->LastUsedActionSequence,
+                current,
+                out var replaced))
+        {
+            return false;
+        }
+
+        // This is the sole native queue mutation in PulseQueue. Ownership proves
+        // that the exact queue entry came from an older certified hotbar input;
+        // a foreign or changed queue can never reach this write.
+        actionManager->ActionQueued = false;
+        ownedNativeQueueReplacementCount++;
+        lastEvent = $"Newest input replaced owned native queue action {replaced.ActionId}";
+        if (configuration.DetailedLogging)
+        {
+            log.Debug(
+                "Replaced owned native queue action={Action}, generation={Generation}, phase={Phase}.",
+                replaced.ActionId,
+                replacingGeneration,
+                phase);
+        }
+
+        return true;
+    }
+
     private Candidate? TryCreateCandidate(
         ActionManager* actionManager,
         ActionType actionType,
@@ -361,8 +526,21 @@ internal sealed unsafe class ActionBufferService : IDisposable
             return null;
         }
 
+        // Compatibility discovery walks foreign plugin assemblies and may invoke an IPC
+        // provider. Keep that work off the latency-sensitive per-press path; topology
+        // changes invalidate immediately and the framework refreshes the immutable
+        // snapshot on a bounded poll.
         RefreshConflicts();
-        if (activeConflicts.Count > 0 || actionType is not (ActionType.Action or ActionType.PvPAction) || actionId == 0)
+        if (!compatibility.IsLiveReActionProfileCurrent())
+        {
+            MarkCompatibilityProfileDirty("ReAction safety settings changed");
+            return null;
+        }
+
+        if (activeConflicts.Count > 0
+            || compatibilityQuarantineFrames > 0
+            || actionType is not (ActionType.Action or ActionType.PvPAction)
+            || actionId == 0)
         {
             return null;
         }
@@ -374,8 +552,20 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
 
         var resolvedId = actionManager->GetAdjustedActionId(actionId);
-        if (resolvedId == 0
-            || !TryGetEligibleActionProfile(actionType, resolvedId, targetId, out var includeResolverTargets))
+        if (resolvedId == 0)
+        {
+            return null;
+        }
+
+        if (excludedIntegrationActionIds.Contains(actionId)
+            || excludedIntegrationActionIds.Contains(resolvedId))
+        {
+            integrationExclusionCount++;
+            lastEvent = $"Action {resolvedId} is owned by MOAction targeting and was not buffered";
+            return null;
+        }
+
+        if (!TryGetEligibleActionProfile(actionType, resolvedId, targetId, out var includeResolverTargets))
         {
             return null;
         }
@@ -386,7 +576,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             return null;
         }
 
-        return new Candidate(
+        var candidate = new Candidate(
             actionType,
             actionId,
             resolvedId,
@@ -395,12 +585,34 @@ internal sealed unsafe class ActionBufferService : IDisposable
             comboRouteId,
             actionManager->LastUsedActionSequence,
             NowMilliseconds,
-            Volatile.Read(ref interruptEpoch),
+            inputGenerations.Current,
             includeResolverTargets,
-            snapshot)
+            snapshot,
+            new ExactActionTuple(
+                (uint)actionType,
+                actionId,
+                resolvedId,
+                targetId,
+                extraParam,
+                (uint)mode,
+                comboRouteId),
+            CaptureNativeQueue(actionManager))
         {
             ExplicitTargetAddress = FindTargetAddress(targetId),
         };
+
+        if (configuration.DetailedLogging)
+        {
+            log.Debug(
+                "Eligible input generation={Generation}, type={Type}, action={Base}->{Resolved}, nativeQueueBefore={Queued}.",
+                candidate.InputGeneration,
+                candidate.ActionType,
+                candidate.RequestedActionId,
+                candidate.ResolvedActionId,
+                candidate.QueueAtCapture.IsQueued);
+        }
+
+        return candidate;
     }
 
     private void ProcessOriginalOutcome(
@@ -417,14 +629,79 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
 
         var areaTargetingStarted = outOptAreaTargeted != null && *outOptAreaTargeted;
-        if (originalResult || sequenceAdvanced || areaTargetingStarted || actionManager == null || actionManager->ActionQueued)
+        if (actionManager == null)
         {
-            lastEvent = originalResult ? "Vanilla accepted the input" : "Vanilla queue/sequence handled the input";
+            lastEvent = "ActionManager unavailable after the original input";
             return;
         }
 
-        if (disposed || faulted || !configuration.Enabled || candidate.InterruptEpoch != Volatile.Read(ref interruptEpoch))
+        var queueAfter = CaptureNativeQueue(actionManager);
+        var nativeOutcome = NativeActionOutcomeClassifier.Classify(
+            originalResult || sequenceAdvanced || areaTargetingStarted,
+            candidate.QueueAtCapture,
+            queueAfter,
+            candidate.ExactTuple);
+        if (configuration.DetailedLogging)
         {
+            log.Debug(
+                "Original outcome generation={Generation}, action={Action}, outcome={Outcome}, result={Result}, sequenceAdvanced={SequenceAdvanced}, queueAfter={Queued}.",
+                candidate.InputGeneration,
+                candidate.ResolvedActionId,
+                nativeOutcome,
+                originalResult,
+                sequenceAdvanced,
+                queueAfter.IsQueued);
+        }
+
+        if (nativeOutcome is NativeActionOutcome.ImmediateAcceptance or NativeActionOutcome.MatchingNewQueue)
+        {
+            if (nativeOutcome == NativeActionOutcome.MatchingNewQueue)
+            {
+                if (!sequenceAdvanced)
+                {
+                    nativeQueueOwnership.TryClaimNewQueue(
+                        candidate.InputGeneration,
+                        currentSequence,
+                        candidate.QueueAtCapture,
+                        queueAfter,
+                        candidate.ExactTuple);
+                }
+
+                nativeQueueAcceptedCount++;
+                lastEvent = $"Native queue accepted action {candidate.ResolvedActionId}";
+            }
+            else
+            {
+                nativeQueueOwnership.Clear();
+                lastEvent = "The original input was accepted immediately";
+            }
+
+            return;
+        }
+
+        if (nativeOutcome == NativeActionOutcome.ForeignOrPreexistingQueue)
+        {
+            nativeQueueBlockedCount++;
+            lastEvent = $"Existing native queue blocked action {candidate.ResolvedActionId}; PulseQueue did not overwrite it";
+            return;
+        }
+
+        if (disposed || faulted || !configuration.Enabled || !inputGenerations.IsCurrent(candidate.InputGeneration))
+        {
+            return;
+        }
+
+        if (!compatibility.IsLiveReActionProfileCurrent())
+        {
+            MarkCompatibilityProfileDirty("ReAction safety settings changed");
+            return;
+        }
+
+        if (!compatibility.IsLiveMOActionUnowned(
+                candidate.RequestedActionId,
+                candidate.ResolvedActionId))
+        {
+            MarkCompatibilityProfileDirty("MOAction ownership changed");
             return;
         }
 
@@ -433,7 +710,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
             candidate.TargetId,
             actionManager->GetAdjustedActionId(candidate.RequestedActionId),
             candidate.IncludeResolverTargets);
-        if (activeConflicts.Count > 0 || !candidate.Snapshot.Equals(currentSnapshot) || !IsSafeSnapshot(currentSnapshot))
+        if (activeConflicts.Count > 0
+            || compatibilityQuarantineFrames > 0
+            || !candidate.Snapshot.Equals(currentSnapshot)
+            || !IsSafeSnapshot(currentSnapshot))
         {
             return;
         }
@@ -499,6 +779,31 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
+    private void OnActivePluginsChanged(IActivePluginsChangedEventArgs _)
+    {
+        // Serialize the topology transition with the last native dispatch boundary.
+        // Whichever side acquires the gate first has a single, auditable ordering.
+        lock (dispatchGate)
+        {
+            inputGenerations.Invalidate();
+            engine.Cancel(CancelReason.Conflict);
+            pendingRuntimeAction = null;
+            nativeQueueOwnership.Clear();
+            lastEvent = "Plugin topology changed";
+            Interlocked.Exchange(ref pluginTopologyDirty, 1);
+        }
+    }
+
+    private void MarkCompatibilityProfileDirty(string detail)
+    {
+        inputGenerations.Invalidate();
+        engine.Cancel(CancelReason.Conflict);
+        pendingRuntimeAction = null;
+        nativeQueueOwnership.Clear();
+        lastEvent = $"{detail}; reassessment scheduled";
+        Interlocked.Exchange(ref pluginTopologyDirty, 1);
+    }
+
     private void OnFrameworkUpdate(IFramework _)
     {
         if (disposed) return;
@@ -506,6 +811,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
         var now = NowMilliseconds;
         try
         {
+            if (Interlocked.Exchange(ref pluginTopologyDirty, 0) != 0)
+            {
+                Cancel(CancelReason.Conflict, "Plugin topology changed; waiting for one clean frame");
+                nativeQueueOwnership.Clear();
+                sentSequences.Clear();
+                observedResponseTimes.Clear();
+                latency.Reset();
+                nextCompatibilityRefreshAt = 0;
+                compatibilityQuarantineFrames = Math.Max(compatibilityQuarantineFrames, 1);
+            }
+
             var frameGap = now - lastFrameworkAt;
             lastFrameworkAt = now;
             Volatile.Write(ref localEntityId, objectTable.LocalPlayer?.EntityId ?? 0);
@@ -518,6 +834,28 @@ internal sealed unsafe class ActionBufferService : IDisposable
             RemoveStaleSequenceMarkers(now);
             DrainTimingSamples();
             DrainTimingHookErrors();
+
+            var observedActionManager = ActionManager.Instance();
+            if (observedActionManager != null)
+            {
+                lock (dispatchGate)
+                {
+                    nativeQueueOwnership.Reconcile(
+                        observedActionManager->LastUsedActionSequence,
+                        CaptureNativeQueue(observedActionManager));
+                }
+            }
+
+            if (compatibilityQuarantineFrames > 0)
+            {
+                compatibilityQuarantineFrames--;
+                if (engine.Pending is not null)
+                {
+                    Cancel(CancelReason.Conflict, "Compatibility state is settling for one clean frame");
+                }
+
+                return;
+            }
 
             if (engine.Pending is null)
             {
@@ -639,7 +977,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             {
                 // The candidate generation is checked again under the dispatch gate.
                 // A later input or cancellation can therefore never revive this token.
-                if (runtime.Candidate.InterruptEpoch != Volatile.Read(ref interruptEpoch))
+                if (!inputGenerations.IsCurrent(runtime.Candidate.InputGeneration))
                 {
                     lastEvent = "Final generation check cancelled the consumed token";
                     return;
@@ -652,6 +990,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
                 }
 
                 var sequenceBefore = actionManager->LastUsedActionSequence;
+                var queueBefore = CaptureNativeQueue(actionManager);
                 var areaTargeted = false;
                 var accepted = useActionHook.Original(
                     actionManager,
@@ -663,12 +1002,33 @@ internal sealed unsafe class ActionBufferService : IDisposable
                     runtime.Candidate.ComboRouteId,
                     &areaTargeted);
                 var sequenceAfter = actionManager->LastUsedActionSequence;
+                var queueAfter = CaptureNativeQueue(actionManager);
+                var replayTuple = runtime.Candidate.ExactTuple with
+                {
+                    Mode = (uint)ActionManager.UseActionMode.Queue,
+                };
 
                 dispatchedCount++;
-                if (accepted && sequenceAfter != sequenceBefore)
+                if (sequenceAfter != sequenceBefore)
                 {
+                    nativeQueueOwnership.Clear();
                     RecordSentSequence(sequenceAfter, NowMilliseconds);
                     lastEvent = $"Dispatched action {runtime.Candidate.ResolvedActionId} once";
+                }
+                else if (queueAfter.Matches(replayTuple) && !queueBefore.Matches(replayTuple))
+                {
+                    nativeQueueOwnership.TryClaimNewQueue(
+                        runtime.Candidate.InputGeneration,
+                        sequenceAfter,
+                        queueBefore,
+                        queueAfter,
+                        replayTuple);
+                    lastEvent = $"Replay queued action {runtime.Candidate.ResolvedActionId} once";
+                }
+                else if (accepted)
+                {
+                    nativeQueueOwnership.Clear();
+                    lastEvent = $"Replay accepted action {runtime.Candidate.ResolvedActionId} once";
                 }
                 else
                 {
@@ -702,9 +1062,26 @@ internal sealed unsafe class ActionBufferService : IDisposable
             || !configuration.Enabled
             || Volatile.Read(ref forcedMovementObserved) != 0
             || NowMilliseconds >= runtime.ExpiresAtMilliseconds
-            || runtime.Candidate.InterruptEpoch != Volatile.Read(ref interruptEpoch)) return false;
+            || !inputGenerations.IsCurrent(runtime.Candidate.InputGeneration)) return false;
+        if (!compatibility.IsLiveReActionProfileCurrent())
+        {
+            MarkCompatibilityProfileDirty("ReAction safety settings changed");
+            return false;
+        }
+
+        if (!compatibility.IsLiveMOActionUnowned(
+                runtime.Candidate.RequestedActionId,
+                runtime.Candidate.ResolvedActionId))
+        {
+            MarkCompatibilityProfileDirty("MOAction ownership changed");
+            return false;
+        }
+
         RefreshConflicts();
-        if (activeConflicts.Count > 0 || actionManager == null || actionManager->ActionQueued) return false;
+        if (activeConflicts.Count > 0
+            || compatibilityQuarantineFrames > 0
+            || actionManager == null
+            || actionManager->ActionQueued) return false;
         if (actionManager->LastUsedActionSequence != runtime.Candidate.SequenceAtCapture) return false;
         if (actionManager->AnimationLock > AnimationLockEpsilonSeconds) return false;
         if (!actionManager->IsActionOffCooldown(runtime.Candidate.ActionType, runtime.Candidate.ResolvedActionId)) return false;
@@ -723,7 +1100,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         return runtime.Candidate.Snapshot.Equals(snapshot)
             && IsSafeSnapshot(snapshot)
             && ExplicitTargetStillExists(runtime.Candidate)
-            && runtime.Candidate.InterruptEpoch == Volatile.Read(ref interruptEpoch);
+            && inputGenerations.IsCurrent(runtime.Candidate.InputGeneration);
     }
 
     private void ReceiveActionEffectDetour(
@@ -764,8 +1141,14 @@ internal sealed unsafe class ActionBufferService : IDisposable
                         continue;
                     }
 
-                    Interlocked.Increment(ref interruptEpoch);
-                    Interlocked.Exchange(ref forcedMovementObserved, 1);
+                    lock (dispatchGate)
+                    {
+                        inputGenerations.Invalidate();
+                        engine.Cancel(CancelReason.Knockback);
+                        pendingRuntimeAction = null;
+                        lastEvent = "Cleared by a local-player knockback action effect";
+                        Interlocked.Exchange(ref forcedMovementObserved, 1);
+                    }
                     break;
                 }
             }
@@ -826,15 +1209,17 @@ internal sealed unsafe class ActionBufferService : IDisposable
             targetFingerprint,
             contextFingerprint,
             resolvedActionId,
+            condition[ConditionFlag.Mounted],
             IsStunned(local),
             condition[ConditionFlag.BeingMoved]);
     }
 
     private BufferSafetyState ToCoreSafety(ActionRequest request, Snapshot snapshot) => new(
         Enabled: configuration.Enabled && !faulted && !disposed,
-        ConflictDetected: activeConflicts.Count > 0,
+        ConflictDetected: activeConflicts.Count > 0 || compatibilityQuarantineFrames > 0,
         LoggedIn: clientState.IsLoggedIn && objectTable.LocalPlayer is not null && !IsBetweenAreas,
         IsAlive: objectTable.LocalPlayer is { IsDead: false } && !condition[ConditionFlag.Unconscious],
+        IsMounted: snapshot.IsMounted,
         IsStunned: snapshot.IsStunned,
         IsKnockbackActive: snapshot.IsBeingMoved,
         TerritoryId: snapshot.TerritoryId,
@@ -847,11 +1232,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
         && !faulted
         && !disposed
         && activeConflicts.Count == 0
+        && compatibilityQuarantineFrames == 0
         && clientState.IsLoggedIn
         && snapshot.LocalGameObjectId != 0
         && snapshot.LocalAddress != nint.Zero
         && objectTable.LocalPlayer is { IsDead: false }
         && !condition[ConditionFlag.Unconscious]
+        && !snapshot.IsMounted
         && !snapshot.IsStunned
         && !snapshot.IsBeingMoved
         && !IsBetweenAreas;
@@ -885,7 +1272,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
         var sheet = dataManager.GetExcelSheet<GameAction>();
         if (sheet is null) return false;
         var action = sheet.GetRow(resolvedActionId);
-        if (action.RowId != resolvedActionId || action.TargetArea) return false;
+        // Movement actions are deliberately excluded: a camera-relative dash can change
+        // direction between the press and a later replay even when its action/target tuple
+        // is otherwise identical.
+        if (action.RowId != resolvedActionId
+            || action.TargetArea
+            || action.AffectsPosition
+            || resolvedActionId == ReActionCameraRelativeMovementException) return false;
 
         includeResolverTargets = targetId is 0 or InvalidObjectId
             && (action.CanTargetAlliance
@@ -897,7 +1290,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         return true;
     }
 
-    private static double GetTemporalRemainingMilliseconds(
+    private double GetTemporalRemainingMilliseconds(
         ActionManager* actionManager,
         ActionType actionType,
         uint resolvedActionId)
@@ -908,10 +1301,29 @@ internal sealed unsafe class ActionBufferService : IDisposable
         {
             var total = actionManager->GetRecastTime(actionType, resolvedActionId);
             var elapsed = actionManager->GetRecastTimeElapsed(actionType, resolvedActionId);
-            cooldown = Math.Max(0, (total - elapsed) * 1000.0);
+            var spellId = ActionManager.GetSpellIdForAction(actionType, resolvedActionId);
+            var level = (uint)(objectTable.LocalPlayer?.Level ?? 100);
+            var maximumCharges = Math.Max(1, (int)ActionManager.GetMaxCharges(spellId, level));
+            cooldown = CooldownTiming.GetNextChargeRemainingMilliseconds(
+                total,
+                elapsed,
+                maximumCharges);
         }
 
         return Math.Max(animationLock, cooldown);
+    }
+
+    private static NativeQueueSnapshot CaptureNativeQueue(ActionManager* actionManager)
+    {
+        if (actionManager == null) return NativeQueueSnapshot.Empty;
+        return new NativeQueueSnapshot(
+            actionManager->ActionQueued,
+            (uint)actionManager->QueuedActionType,
+            actionManager->QueuedActionId,
+            (ulong)actionManager->QueuedTargetId,
+            actionManager->QueuedExtraParam,
+            (uint)actionManager->QueueType,
+            actionManager->QueuedComboRouteId);
     }
 
     private int CurrentHoldWindowMilliseconds
@@ -933,18 +1345,38 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private static bool IsStunned(IPlayerCharacter? player) =>
         player?.StatusList.Any(status => status.StatusId == StunStatusId) == true;
 
-    private void RefreshConflicts()
+    private void RefreshConflicts(bool force = false)
     {
-        activeConflicts = pluginInterface.InstalledPlugins
-            .Where(plugin => plugin.IsLoaded && IncompatibleInternalNames.Contains(plugin.InternalName))
-            .Select(plugin => plugin.InternalName)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        var now = NowMilliseconds;
+        if (!force && now < nextCompatibilityRefreshAt) return;
+        nextCompatibilityRefreshAt = SaturatingAdd(now, CompatibilityPollIntervalMilliseconds);
+
+        var assessment = compatibility.Assess();
+        var changed = compatibilitySignature.Length > 0
+            && !string.Equals(compatibilitySignature, assessment.Signature, StringComparison.Ordinal);
+
+        compatibilitySignature = assessment.Signature;
+        activeConflicts = assessment.Conflicts;
+        activeIntegrations = assessment.Integrations;
+        excludedIntegrationActionIds = assessment.ExcludedActionIds;
+
+        if (changed)
+        {
+            lock (dispatchGate)
+            {
+                compatibilityQuarantineFrames = Math.Max(compatibilityQuarantineFrames, 1);
+                Cancel(CancelReason.Conflict, "Plugin compatibility settings changed; waiting for one clean frame");
+                nativeQueueOwnership.Clear();
+            }
+        }
 
         if (activeConflicts.Count > 0 && engine.Pending is not null)
         {
-            Cancel(CancelReason.Conflict, $"Suspended for {string.Join(", ", activeConflicts)}");
+            lock (dispatchGate)
+            {
+                Cancel(CancelReason.Conflict, "Suspended by the current plugin compatibility profile");
+                nativeQueueOwnership.Clear();
+            }
         }
     }
 
@@ -1011,9 +1443,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
         lock (dispatchGate)
         {
             faulted = true;
-            Interlocked.Increment(ref interruptEpoch);
+            inputGenerations.Invalidate();
             engine.Cancel(CancelReason.Explicit);
             pendingRuntimeAction = null;
+            nativeQueueOwnership.Clear();
             lastEvent = $"Faulted: {context}";
             if (!faultLogged)
             {
@@ -1027,7 +1460,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
     {
         if (faulted) return RuntimeState.Faulted;
         if (!configuration.Enabled || disposed) return RuntimeState.Off;
-        if (activeConflicts.Count > 0 || !clientState.IsLoggedIn || IsBetweenAreas) return RuntimeState.Suspended;
+        if (activeConflicts.Count > 0
+            || compatibilityQuarantineFrames > 0
+            || !clientState.IsLoggedIn
+            || IsBetweenAreas) return RuntimeState.Suspended;
         if (engine.Pending is not null) return configuration.DryRun ? RuntimeState.DryRun : RuntimeState.Pending;
         return RuntimeState.Ready;
     }
@@ -1039,6 +1475,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         RuntimeState.Pending => "Pending - one exact action is buffered",
         RuntimeState.DryRun => "Dry run - pending actions are observed but never replayed",
         RuntimeState.Suspended when activeConflicts.Count > 0 => $"Suspended - conflict: {string.Join(", ", activeConflicts)}",
+        RuntimeState.Suspended when compatibilityQuarantineFrames > 0 => "Suspended - compatibility state is settling",
         RuntimeState.Suspended => "Suspended - player or zone context is not stable",
         RuntimeState.Faulted => "Faulted closed - reload or reset required",
         _ => state.ToString(),
@@ -1096,9 +1533,11 @@ internal sealed unsafe class ActionBufferService : IDisposable
         uint ComboRouteId,
         ushort SequenceAtCapture,
         long CapturedAtMilliseconds,
-        int InterruptEpoch,
+        long InputGeneration,
         bool IncludeResolverTargets,
-        Snapshot Snapshot)
+        Snapshot Snapshot,
+        ExactActionTuple ExactTuple,
+        NativeQueueSnapshot QueueAtCapture)
     {
         public nint ExplicitTargetAddress { get; init; }
     }
@@ -1108,6 +1547,13 @@ internal sealed unsafe class ActionBufferService : IDisposable
         ActionRequest ActionRequest,
         double InitialTemporalRemainderMilliseconds,
         long ExpiresAtMilliseconds);
+
+    private sealed class HotbarInputScope(long generation)
+    {
+        public long Generation { get; } = generation;
+
+        public bool MaySupersedeOwnedQueue { get; set; }
+    }
 
     private sealed record Snapshot(
         uint TerritoryId,
@@ -1124,6 +1570,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
         ulong TargetFingerprint,
         ulong ContextFingerprint,
         uint ResolvedActionId,
+        bool IsMounted,
         bool IsStunned,
         bool IsBeingMoved);
 }
