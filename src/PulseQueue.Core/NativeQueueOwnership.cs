@@ -9,6 +9,8 @@ public sealed class NativeQueueOwnership
 {
     private readonly object gate = new();
     private OwnedQueue? owned;
+    private ActiveDrainLease? activeDrainLease;
+    private ulong nextDrainLeaseId;
 
     public bool HasOwnership
     {
@@ -37,6 +39,9 @@ public sealed class NativeQueueOwnership
                 return false;
             }
 
+            // A newly proven queue supersedes any in-flight proof for the old
+            // entry. Its stale completion must not be able to mutate this owner.
+            activeDrainLease = null;
             owned = new OwnedQueue(generation, sequenceMarker, after, attempted);
             return true;
         }
@@ -52,6 +57,11 @@ public sealed class NativeQueueOwnership
         {
             replaceable = default;
             if (owned is not { } value)
+            {
+                return false;
+            }
+
+            if (activeDrainLease is not null)
             {
                 return false;
             }
@@ -82,6 +92,169 @@ public sealed class NativeQueueOwnership
     }
 
     /// <summary>
+    /// Consumes ownership of the exact currently visible native queue entry once,
+    /// when it belongs to or predates the supplied terminal generation cutoff.
+    /// A temporarily hidden queue preserves ownership so an outer compatibility
+    /// hook may restore it. Any visible queue whose snapshot or sequence differs
+    /// invalidates ownership; an exact newer-generation queue remains owned.
+    /// </summary>
+    public bool TryTakeExactCurrent(
+        long maximumGeneration,
+        uint sequenceMarker,
+        NativeQueueSnapshot current,
+        out NativeQueueSnapshot replaceable)
+    {
+        lock (gate)
+        {
+            replaceable = default;
+            if (maximumGeneration <= 0 || owned is not { } value)
+            {
+                return false;
+            }
+
+            if (activeDrainLease is not null)
+            {
+                return false;
+            }
+
+            // Compatibility hooks may temporarily clear ActionQueued around an
+            // inner call, then restore the exact entry after returning.
+            if (!current.IsQueued)
+            {
+                return false;
+            }
+
+            if (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker)
+            {
+                owned = null;
+                return false;
+            }
+
+            if (value.Generation > maximumGeneration)
+            {
+                return false;
+            }
+
+            replaceable = value.Snapshot;
+            owned = null;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Leases the exact currently visible owned queue entry for one native drain
+    /// invocation without consuming ownership before that invocation returns.
+    /// This lets an outer compatibility hook temporarily hide the entry and
+    /// restore it when its inner invocation rejects. Only one lease may be active;
+    /// duplicate or re-entrant drain attempts fail without changing ownership.
+    /// </summary>
+    public bool TryBeginExactDrain(
+        long generation,
+        uint sequenceMarker,
+        NativeQueueSnapshot current,
+        ExactActionTuple attempted,
+        out NativeQueueDrainLease lease)
+    {
+        lock (gate)
+        {
+            lease = default;
+            if (activeDrainLease is not null || owned is not { } value)
+            {
+                return false;
+            }
+
+            // An outer compatibility hook may already have hidden the exact
+            // entry before this inner detour runs. Decline without destroying
+            // the proof; the same hook may restore it after returning.
+            if (!current.IsQueued)
+            {
+                return false;
+            }
+
+            if (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker)
+            {
+                owned = null;
+                return false;
+            }
+
+            if (generation != value.Generation
+                || attempted != value.Attempted
+                || !current.Matches(attempted))
+            {
+                return false;
+            }
+
+            nextDrainLeaseId++;
+            if (nextDrainLeaseId == 0)
+            {
+                nextDrainLeaseId++;
+            }
+
+            lease = new NativeQueueDrainLease(nextDrainLeaseId);
+            activeDrainLease = new ActiveDrainLease(nextDrainLeaseId, value);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Confirms that a temporarily hidden drain invocation still names the one
+    /// exact owner and that no other drain lease is in flight. Callers may use
+    /// this only when native queue visibility is absent; it does not authorize a
+    /// mutation or consume ownership.
+    /// </summary>
+    public bool CanDeferExactHiddenDrain(
+        long generation,
+        ExactActionTuple attempted)
+    {
+        lock (gate)
+        {
+            return activeDrainLease is null
+                && owned is { } value
+                && generation == value.Generation
+                && attempted == value.Attempted;
+        }
+    }
+
+    /// <summary>
+    /// Finalizes a previously leased exact drain using the stable native queue
+    /// state observed after the invocation returns. The exact same snapshot and
+    /// sequence retain ownership (the rejected entry was restored); an empty
+    /// queue consumes it; and any visible or sequence identity change invalidates
+    /// it. A stale, duplicate, revoked, or forged lease changes nothing.
+    /// </summary>
+    public NativeQueueDrainFinalizeResult CompleteExactDrain(
+        NativeQueueDrainLease lease,
+        uint sequenceMarker,
+        NativeQueueSnapshot current)
+    {
+        lock (gate)
+        {
+            if (!lease.IsValid
+                || activeDrainLease is not { } active
+                || active.LeaseId != lease.LeaseId)
+            {
+                return NativeQueueDrainFinalizeResult.InvalidLease;
+            }
+
+            activeDrainLease = null;
+            if (owned is not { } value || !ReferenceEquals(value, active.Owner))
+            {
+                return NativeQueueDrainFinalizeResult.InvalidLease;
+            }
+
+            if (sequenceMarker == value.SequenceMarker && current.Equals(value.Snapshot))
+            {
+                return NativeQueueDrainFinalizeResult.OwnershipRetained;
+            }
+
+            owned = null;
+            return current.IsQueued
+                ? NativeQueueDrainFinalizeResult.OwnershipInvalidated
+                : NativeQueueDrainFinalizeResult.OwnershipConsumed;
+        }
+    }
+
+    /// <summary>
     /// Authorizes one native invocation as the drain of the exact queue entry
     /// previously claimed by this generation. A successful authorization consumes
     /// ownership, so the same queue can never authorize a second invocation.
@@ -96,7 +269,7 @@ public sealed class NativeQueueOwnership
     {
         lock (gate)
         {
-            if (owned is not { } value)
+            if (activeDrainLease is not null || owned is not { } value)
             {
                 return false;
             }
@@ -127,6 +300,7 @@ public sealed class NativeQueueOwnership
                 && (!current.Equals(value.Snapshot) || sequenceMarker != value.SequenceMarker))
             {
                 owned = null;
+                activeDrainLease = null;
             }
         }
     }
@@ -136,6 +310,7 @@ public sealed class NativeQueueOwnership
         lock (gate)
         {
             owned = null;
+            activeDrainLease = null;
         }
     }
 
@@ -144,4 +319,26 @@ public sealed class NativeQueueOwnership
         uint SequenceMarker,
         NativeQueueSnapshot Snapshot,
         ExactActionTuple Attempted);
+
+    private sealed record ActiveDrainLease(ulong LeaseId, OwnedQueue Owner);
+}
+
+/// <summary>
+/// Opaque proof that one exact owned native queue drain is in flight.
+/// </summary>
+public readonly struct NativeQueueDrainLease
+{
+    internal NativeQueueDrainLease(ulong leaseId) => LeaseId = leaseId;
+
+    internal ulong LeaseId { get; }
+
+    public bool IsValid => LeaseId != 0;
+}
+
+public enum NativeQueueDrainFinalizeResult
+{
+    InvalidLease = 0,
+    OwnershipRetained = 1,
+    OwnershipConsumed = 2,
+    OwnershipInvalidated = 3,
 }

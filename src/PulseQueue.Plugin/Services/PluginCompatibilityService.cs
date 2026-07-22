@@ -241,16 +241,20 @@ internal sealed class PluginCompatibilityService
             safe = false;
         }
 
+        // These capabilities operate only on inputs PulseQueue already refuses
+        // to own. Mounted presses fail the complete safety snapshot, and every
+        // movement/position-changing action (including ReAction's directionals
+        // exception) is excluded from buffering and Turbo. Keep the fields in
+        // the live snapshot so a settings change still invalidates active work,
+        // but do not globally suspend unrelated actions.
         if (configuration.AutoDismountEnabled)
         {
-            conflicts.Add("Disable ReAction's Auto Dismount while PulseQueue is enabled.");
-            safe = false;
+            integrations.Add("ReAction Auto Dismount (mounted inputs passed through, never owned)");
         }
 
         if (configuration.CameraRelativeDirectionalsEnabled)
         {
-            conflicts.Add("Disable ReAction's Camera Relative Directionals while PulseQueue is enabled.");
-            safe = false;
+            integrations.Add("ReAction Camera Relative Directionals (movement actions excluded)");
         }
 
         if (safe)

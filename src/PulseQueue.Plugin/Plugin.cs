@@ -21,6 +21,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windowSystem = new("PulseQueue");
     private readonly ActionBufferService actionBuffer;
     private readonly SettingsWindow settingsWindow;
+    private string reportedConflictSignature = string.Empty;
 
     public Plugin(
         IDalamudPluginInterface pluginInterface,
@@ -66,6 +67,7 @@ public sealed class Plugin : IDalamudPlugin
         pluginInterface.UiBuilder.OpenMainUi += OpenSettings;
         pluginInterface.UiBuilder.OpenConfigUi += OpenSettings;
         actionBuffer.Start();
+        ReportCompatibilityState();
     }
 
     public void Dispose()
@@ -78,7 +80,33 @@ public sealed class Plugin : IDalamudPlugin
         windowSystem.RemoveAllWindows();
     }
 
-    private void Draw() => windowSystem.Draw();
+    private void Draw()
+    {
+        ReportCompatibilityState();
+        windowSystem.Draw();
+    }
+
+    private void ReportCompatibilityState()
+    {
+        var conflicts = actionBuffer.Diagnostics.Conflicts;
+        var signature = conflicts.Count == 0
+            ? "clear"
+            : string.Join("\n", conflicts);
+        if (string.Equals(signature, reportedConflictSignature, StringComparison.Ordinal)) return;
+
+        var previouslyBlocked = reportedConflictSignature.Length > 0
+            && !string.Equals(reportedConflictSignature, "clear", StringComparison.Ordinal);
+        reportedConflictSignature = signature;
+        if (conflicts.Count > 0)
+        {
+            chatGui.PrintError(
+                $"[PulseQueue] PAUSED by compatibility settings: {string.Join("; ", conflicts)} Open /pulsequeue to see the exact blockers.");
+        }
+        else if (previouslyBlocked)
+        {
+            chatGui.Print("[PulseQueue] Compatibility blockers cleared. Smart buffer and enabled Turbo modes are available again.");
+        }
+    }
 
     private void OpenSettings() => settingsWindow.IsOpen = true;
 
@@ -189,7 +217,7 @@ public sealed class Plugin : IDalamudPlugin
             + $"RTT={value.EstimatedResponseMilliseconds:0} ms/{value.AcceptedTimingSamples} samples; "
             + $"captured={value.Captured}, dispatched={value.Dispatched}, rejected={value.ReplayRejected}; "
             + $"inputs={value.ObservedHotbarInputs}, replaced={value.ReplacedPendingInputs}; "
-            + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} owned-replaced; "
+            + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} replaced/{value.OwnedNativeQueueSafetyClears} safety-cleared; "
             + $"turbo={value.TurboState} {value.TurboPulses}/{value.TurboAccepted}/{value.TurboRejected}, suppressed-held={value.TurboSuppressedHeldRepeats}, {value.TurboStatus}, macros={(configuration.TurboMacrosEnabled ? "on" : "off")}; "
             + $"integrations={integrations}; conflicts={conflicts}; last={value.LastEvent}");
     }

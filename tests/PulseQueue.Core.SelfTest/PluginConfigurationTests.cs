@@ -8,6 +8,8 @@ internal static class PluginConfigurationTests
         yield return ("Turbo configuration defaults are opt-in", DefaultsAreOptIn);
         yield return ("schema 1 migrates to safe Turbo defaults", SchemaOneMigratesSafely);
         yield return ("schema 2 migrates with Macro Turbo off", SchemaTwoMigratesMacroTurboOff);
+        yield return ("schema 3 legacy cadence migrates to responsive defaults", SchemaThreeMigratesLegacyCadence);
+        yield return ("schema 3 custom cadence is preserved", SchemaThreePreservesCustomCadence);
         yield return ("Turbo timing is normalized before persistence", TimingNormalizesBeforePersistence);
         yield return ("future configuration fails closed without rewrite", FutureSchemaFailsClosedWithoutRewrite);
         yield return ("explicit reset replaces a future configuration", ResetReplacesFutureSchema);
@@ -71,6 +73,50 @@ internal static class PluginConfigurationTests
         True(configuration.TurboOutOfCombat);
         Equal(1, persistence.SaveCount);
         Same(configuration, persistence.LastSaved);
+    }
+
+    private static void SchemaThreeMigratesLegacyCadence()
+    {
+        var persistence = new FakePluginInterface();
+        var configuration = new PluginConfiguration
+        {
+            Version = 3,
+            TurboEnabled = true,
+            TurboMacrosEnabled = true,
+            TurboInitialDelayMs = 180,
+            TurboRepeatIntervalMs = 80,
+            TurboOutOfCombat = true,
+        };
+
+        configuration.Initialize(persistence);
+
+        Equal(PluginConfiguration.CurrentVersion, configuration.Version);
+        True(configuration.TurboEnabled);
+        True(configuration.TurboMacrosEnabled);
+        Equal(PluginConfiguration.DefaultTurboInitialDelayMilliseconds, configuration.TurboInitialDelayMs);
+        Equal(PluginConfiguration.DefaultTurboRepeatIntervalMilliseconds, configuration.TurboRepeatIntervalMs);
+        True(configuration.TurboOutOfCombat);
+        Equal(1, persistence.SaveCount);
+    }
+
+    private static void SchemaThreePreservesCustomCadence()
+    {
+        var persistence = new FakePluginInterface();
+        var configuration = new PluginConfiguration
+        {
+            Version = 3,
+            TurboEnabled = true,
+            TurboMacrosEnabled = true,
+            TurboInitialDelayMs = 120,
+            TurboRepeatIntervalMs = 90,
+        };
+
+        configuration.Initialize(persistence);
+
+        Equal(PluginConfiguration.CurrentVersion, configuration.Version);
+        Equal(120, configuration.TurboInitialDelayMs);
+        Equal(90, configuration.TurboRepeatIntervalMs);
+        Equal(1, persistence.SaveCount);
     }
 
     private static void TimingNormalizesBeforePersistence()

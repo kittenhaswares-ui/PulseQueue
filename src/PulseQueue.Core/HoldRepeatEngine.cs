@@ -79,8 +79,8 @@ public readonly record struct HoldRepeatOptions(
     public const int AbsoluteMaximumHoldMilliseconds = 30_000;
 
     public static HoldRepeatOptions Default => new(
-        InitialDelayMilliseconds: 180,
-        IntervalMilliseconds: 80,
+        InitialDelayMilliseconds: 0,
+        IntervalMilliseconds: MinimumTimingMilliseconds,
         MaximumHoldMilliseconds: AbsoluteMaximumHoldMilliseconds);
 
     public HoldRepeatOptions Normalize()

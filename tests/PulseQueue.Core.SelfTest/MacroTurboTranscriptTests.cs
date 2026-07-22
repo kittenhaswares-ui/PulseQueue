@@ -2,194 +2,194 @@ using PulseQueue.Core;
 
 internal static class MacroTurboTranscriptTests
 {
-    private static readonly MacroTurboTranscriptEntry First = new(
-        ActionType: 1,
-        RequestedActionId: 100,
-        ResolvedActionId: 101,
-        TargetId: 200,
-        ExtraParam: 3,
-        RouteId: 4,
-        ResolverFingerprint: 500);
-
-    private static readonly MacroTurboTranscriptEntry Second = new(
-        ActionType: 14,
-        RequestedActionId: 300,
-        ResolvedActionId: 301,
-        TargetId: 400,
-        ExtraParam: 5,
-        RouteId: 6,
-        ResolverFingerprint: 700);
-
     public static IEnumerable<(string Name, Action Body)> All()
     {
-        yield return ("macro transcript freezes exact expected count", ExactCountFreezes);
-        yield return ("macro transcript rejects incomplete build", IncompleteBuildRejects);
-        yield return ("macro transcript rejects extra build entry", ExtraBuildEntryRejects);
-        yield return ("macro transcript rejects invalid build entry", InvalidBuildEntryRejects);
-        yield return ("macro transcript preserves duplicate ordered entries", DuplicateEntriesArePreserved);
-        yield return ("macro transcript cursor requires semantic order", CursorRequiresOrder);
-        yield return ("macro transcript cursor detects every semantic mismatch", CursorDetectsSemanticMismatch);
-        yield return ("macro transcript cursor detects incomplete execution", CursorDetectsIncompleteExecution);
-        yield return ("macro transcript cursor detects extra execution entry", CursorDetectsExtraExecutionEntry);
-        yield return ("macro transcript permits dynamic resolved action IDs", DynamicResolvedIdsArePermitted);
-        yield return ("macro transcript cursors are independent", ExecutionCursorsAreIndependent);
-        yield return ("macro transcript terminal failure cannot recover", TerminalFailureCannotRecover);
+        yield return ("macro execution budget requires a positive limit", PositiveLimitIsRequired);
+        yield return ("macro execution budget accepts zero action calls", ZeroActionCallsComplete);
+        yield return ("macro execution budget accepts one action call", OneActionCallCompletes);
+        yield return ("macro execution budget accepts its maximum action count", MaximumActionCallsComplete);
+        yield return ("macro execution budget accepts one native outcome", OneAcceptedOutcomeCompletes);
+        yield return ("macro execution budget rejects action N plus one", ActionBeyondMaximumFails);
+        yield return ("macro execution budget blocks action after accepted outcome", ActionAfterAcceptedOutcomeIsBlocked);
+        yield return ("macro execution budget preserves duplicate call count", DuplicateCallsAreCounted);
+        yield return ("macro execution budget rejects outcome without action", OutcomeWithoutActionFails);
+        yield return ("macro execution budget rejects a second accepted outcome", SecondAcceptedOutcomeFails);
+        yield return ("macro execution budgets are independent", BudgetsAreIndependent);
+        yield return ("completed macro execution budget stays closed", CompletedBudgetCannotRevive);
+        yield return ("failed macro execution budget stays terminal", TerminalFailureCannotRecover);
     }
 
-    private static void ExactCountFreezes()
+    private static void PositiveLimitIsRequired()
     {
-        var builder = new MacroTurboTranscriptBuilder(expectedActionCount: 2);
-        Equal(2, builder.ExpectedActionCount);
-        Equal(MacroTurboBuildStepResult.Appended, builder.Append(First));
-        Equal(MacroTurboBuildStepResult.Appended, builder.Append(Second));
-        Equal(2, builder.ObservedActionCount);
-        Equal(MacroTurboFreezeResult.Frozen, builder.Freeze(out var transcript));
-        NotNull(transcript);
-        Equal(2, transcript!.ExpectedActionCount);
-        Equal(2, transcript.Count);
-        Equal(First, transcript[0]);
-        Equal(Second, transcript[1]);
-        Equal(MacroTurboFreezeResult.AlreadyClosed, builder.Freeze(out _));
-        Equal(MacroTurboBuildStepResult.Closed, builder.Append(First));
+        Throws<ArgumentOutOfRangeException>(() => new MacroTurboExecutionBudget(0));
+        Throws<ArgumentOutOfRangeException>(() => new MacroTurboExecutionBudget(-1));
     }
 
-    private static void IncompleteBuildRejects()
+    private static void ZeroActionCallsComplete()
     {
-        var builder = new MacroTurboTranscriptBuilder(expectedActionCount: 2);
-        Equal(MacroTurboBuildStepResult.Appended, builder.Append(First));
-        Equal(MacroTurboFreezeResult.Incomplete, builder.Freeze(out var transcript));
-        Null(transcript);
-        Equal(MacroTurboBuildStepResult.Closed, builder.Append(Second));
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 3);
+
+        Equal(3, budget.MaxActionCalls);
+        Equal(0, budget.ObservedActionCalls);
+        Equal(0, budget.AcceptedOutcomeCount);
+        False(budget.IsTerminal);
+        Null(budget.TerminalResult);
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.TerminalResult!.Value);
+        True(budget.IsTerminal);
     }
 
-    private static void ExtraBuildEntryRejects()
+    private static void OneActionCallCompletes()
     {
-        var builder = new MacroTurboTranscriptBuilder(expectedActionCount: 1);
-        Equal(MacroTurboBuildStepResult.Appended, builder.Append(First));
-        Equal(MacroTurboBuildStepResult.ExtraEntry, builder.Append(Second));
-        Equal(MacroTurboFreezeResult.ExtraEntry, builder.Freeze(out var transcript));
-        Null(transcript);
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 3);
+
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(1, budget.ObservedActionCalls);
+        Equal(0, budget.AcceptedOutcomeCount);
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
     }
 
-    private static void InvalidBuildEntryRejects()
+    private static void MaximumActionCallsComplete()
     {
-        Throws<ArgumentOutOfRangeException>(() => new MacroTurboTranscriptBuilder(0));
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 3);
 
-        var builder = new MacroTurboTranscriptBuilder(expectedActionCount: 1);
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(3, budget.ObservedActionCalls);
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
+    }
+
+    private static void OneAcceptedOutcomeCompletes()
+    {
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 2);
+
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboAcceptedOutcomeMarkResult.Marked, budget.MarkAcceptedOutcome());
+        Equal(1, budget.AcceptedOutcomeCount);
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
+    }
+
+    private static void ActionBeyondMaximumFails()
+    {
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 2);
+
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboActionObservationResult.ActionLimitExceeded, budget.ObserveAction());
+        Equal(2, budget.ObservedActionCalls);
+        Equal(MacroTurboExecutionBudgetResult.ActionLimitExceeded, budget.TerminalResult!.Value);
+        Equal(MacroTurboExecutionBudgetResult.ActionLimitExceeded, budget.Finish());
+    }
+
+    private static void ActionAfterAcceptedOutcomeIsBlocked()
+    {
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 3);
+
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboAcceptedOutcomeMarkResult.Marked, budget.MarkAcceptedOutcome());
+
+        // ObserveAction is called before the native original. Keeping the count
+        // at one proves that the second original must remain blocked.
         Equal(
-            MacroTurboBuildStepResult.InvalidEntry,
-            builder.Append(First with { RequestedActionId = 0 }));
-        Equal(MacroTurboBuildStepResult.Faulted, builder.Append(First));
-        Equal(MacroTurboFreezeResult.InvalidEntry, builder.Freeze(out var transcript));
-        Null(transcript);
+            MacroTurboActionObservationResult.AcceptedOutcomeAlreadyMarked,
+            budget.ObserveAction());
+        Equal(1, budget.ObservedActionCalls);
+        Equal(1, budget.AcceptedOutcomeCount);
+        Equal(
+            MacroTurboExecutionBudgetResult.ActionAfterAcceptedOutcome,
+            budget.TerminalResult!.Value);
     }
 
-    private static void DuplicateEntriesArePreserved()
+    private static void DuplicateCallsAreCounted()
     {
-        var transcript = Freeze(First, First);
-        Equal(First, transcript[0]);
-        Equal(First, transcript[1]);
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 4);
 
-        var cursor = transcript.StartExecution();
-        Equal(MacroTurboExecutionAcceptResult.Accepted, cursor.Accept(First));
-        Equal(MacroTurboExecutionAcceptResult.Accepted, cursor.Accept(First));
-        Equal(MacroTurboExecutionResult.Complete, cursor.Finish());
-    }
-
-    private static void CursorRequiresOrder()
-    {
-        var cursor = Freeze(First, Second).StartExecution();
-        Equal(MacroTurboExecutionAcceptResult.Mismatch, cursor.Accept(Second));
-        Equal(MacroTurboExecutionResult.Mismatch, cursor.Finish());
-        Equal(0, cursor.AcceptedCount);
-    }
-
-    private static void CursorDetectsSemanticMismatch()
-    {
-        var mismatches = new[]
+        // There is intentionally no action-identity deduplication: repeated
+        // identical macro lines each consume one budget entry.
+        for (var index = 0; index < 4; index++)
         {
-            First with { ActionType = 2 },
-            First with { RequestedActionId = 999 },
-            First with { TargetId = 999 },
-            First with { ExtraParam = 999 },
-            First with { RouteId = 999 },
-            First with { ResolverFingerprint = 999 },
-        };
-
-        foreach (var mismatch in mismatches)
-        {
-            var cursor = Freeze(First).StartExecution();
-            Equal(MacroTurboExecutionAcceptResult.Mismatch, cursor.Accept(mismatch));
-            Equal(MacroTurboExecutionResult.Mismatch, cursor.TerminalResult!.Value);
+            Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
         }
+
+        Equal(4, budget.ObservedActionCalls);
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
     }
 
-    private static void CursorDetectsIncompleteExecution()
+    private static void OutcomeWithoutActionFails()
     {
-        var cursor = Freeze(First, Second).StartExecution();
-        Equal(MacroTurboExecutionAcceptResult.Accepted, cursor.Accept(First));
-        Equal(MacroTurboExecutionResult.Incomplete, cursor.Finish());
-        Equal(MacroTurboExecutionResult.Incomplete, cursor.TerminalResult!.Value);
-        True(cursor.IsTerminal);
-    }
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 1);
 
-    private static void CursorDetectsExtraExecutionEntry()
-    {
-        var cursor = Freeze(First).StartExecution();
-        Equal(MacroTurboExecutionAcceptResult.Accepted, cursor.Accept(First));
-        Equal(MacroTurboExecutionAcceptResult.Extra, cursor.Accept(Second));
-        Equal(MacroTurboExecutionResult.Extra, cursor.Finish());
-    }
-
-    private static void DynamicResolvedIdsArePermitted()
-    {
-        var transcript = Freeze(First);
-        Equal(First.ResolvedActionId, transcript[0].ResolvedActionId);
-
-        var cursor = transcript.StartExecution();
+        Equal(MacroTurboAcceptedOutcomeMarkResult.NoObservedAction, budget.MarkAcceptedOutcome());
+        Equal(0, budget.AcceptedOutcomeCount);
         Equal(
-            MacroTurboExecutionAcceptResult.Accepted,
-            cursor.Accept(First with { ResolvedActionId = 9_999 }));
-        Equal(MacroTurboExecutionResult.Complete, cursor.Finish());
+            MacroTurboExecutionBudgetResult.AcceptedOutcomeWithoutAction,
+            budget.TerminalResult!.Value);
     }
 
-    private static void ExecutionCursorsAreIndependent()
+    private static void SecondAcceptedOutcomeFails()
     {
-        var transcript = Freeze(First, Second);
-        var firstExecution = transcript.StartExecution();
-        var secondExecution = transcript.StartExecution();
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 2);
 
-        Equal(MacroTurboExecutionAcceptResult.Accepted, firstExecution.Accept(First));
-        Equal(MacroTurboExecutionResult.Incomplete, firstExecution.Finish());
-        Equal(MacroTurboExecutionAcceptResult.Accepted, secondExecution.Accept(First));
-        Equal(MacroTurboExecutionAcceptResult.Accepted, secondExecution.Accept(Second));
-        Equal(MacroTurboExecutionResult.Complete, secondExecution.Finish());
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboAcceptedOutcomeMarkResult.Marked, budget.MarkAcceptedOutcome());
+        Equal(MacroTurboAcceptedOutcomeMarkResult.AlreadyMarked, budget.MarkAcceptedOutcome());
+        Equal(1, budget.AcceptedOutcomeCount);
+        Equal(
+            MacroTurboExecutionBudgetResult.MultipleAcceptedOutcomes,
+            budget.TerminalResult!.Value);
+    }
+
+    private static void BudgetsAreIndependent()
+    {
+        var first = new MacroTurboExecutionBudget(maxActionCalls: 1);
+        var second = new MacroTurboExecutionBudget(maxActionCalls: 2);
+
+        Equal(MacroTurboActionObservationResult.Allowed, first.ObserveAction());
+        Equal(MacroTurboActionObservationResult.ActionLimitExceeded, first.ObserveAction());
+
+        Equal(MacroTurboActionObservationResult.Allowed, second.ObserveAction());
+        Equal(MacroTurboActionObservationResult.Allowed, second.ObserveAction());
+        Equal(MacroTurboExecutionBudgetResult.Complete, second.Finish());
+
+        Equal(MacroTurboExecutionBudgetResult.ActionLimitExceeded, first.Finish());
+        Equal(2, second.ObservedActionCalls);
+    }
+
+    private static void CompletedBudgetCannotRevive()
+    {
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 1);
+
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
+        Equal(MacroTurboActionObservationResult.Closed, budget.ObserveAction());
+        Equal(MacroTurboAcceptedOutcomeMarkResult.Closed, budget.MarkAcceptedOutcome());
+        Equal(MacroTurboExecutionBudgetResult.Complete, budget.Finish());
+        Equal(0, budget.ObservedActionCalls);
+        Equal(0, budget.AcceptedOutcomeCount);
     }
 
     private static void TerminalFailureCannotRecover()
     {
-        var cursor = Freeze(First, Second).StartExecution();
-        Equal(MacroTurboExecutionAcceptResult.Mismatch, cursor.Accept(Second));
-        Equal(MacroTurboExecutionAcceptResult.Closed, cursor.Accept(First));
-        Equal(MacroTurboExecutionResult.Mismatch, cursor.Finish());
-    }
+        var budget = new MacroTurboExecutionBudget(maxActionCalls: 1);
 
-    private static MacroTurboTranscript Freeze(params MacroTurboTranscriptEntry[] entries)
-    {
-        var builder = new MacroTurboTranscriptBuilder(entries.Length);
-        foreach (var entry in entries)
-        {
-            Equal(MacroTurboBuildStepResult.Appended, builder.Append(entry));
-        }
-
-        Equal(MacroTurboFreezeResult.Frozen, builder.Freeze(out var transcript));
-        NotNull(transcript);
-        return transcript!;
+        Equal(MacroTurboActionObservationResult.Allowed, budget.ObserveAction());
+        Equal(MacroTurboActionObservationResult.ActionLimitExceeded, budget.ObserveAction());
+        Equal(MacroTurboActionObservationResult.Closed, budget.ObserveAction());
+        Equal(MacroTurboAcceptedOutcomeMarkResult.Closed, budget.MarkAcceptedOutcome());
+        Equal(MacroTurboExecutionBudgetResult.ActionLimitExceeded, budget.Finish());
+        Equal(MacroTurboExecutionBudgetResult.ActionLimitExceeded, budget.TerminalResult!.Value);
+        Equal(1, budget.ObservedActionCalls);
+        Equal(0, budget.AcceptedOutcomeCount);
     }
 
     private static void True(bool value)
     {
         if (!value) throw new InvalidOperationException("Expected true.");
+    }
+
+    private static void False(bool value)
+    {
+        if (value) throw new InvalidOperationException("Expected false.");
     }
 
     private static void Equal<T>(T expected, T actual)
@@ -201,14 +201,8 @@ internal static class MacroTurboTranscriptTests
         }
     }
 
-    private static void NotNull<T>(T? value)
-        where T : class
-    {
-        if (value is null) throw new InvalidOperationException("Expected non-null value.");
-    }
-
     private static void Null<T>(T? value)
-        where T : class
+        where T : struct
     {
         if (value is not null) throw new InvalidOperationException("Expected null value.");
     }

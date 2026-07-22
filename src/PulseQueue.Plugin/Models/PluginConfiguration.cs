@@ -5,13 +5,16 @@ namespace PulseQueue.Plugin.Models;
 
 public sealed class PluginConfiguration : IPluginConfiguration
 {
-    public const int CurrentVersion = 3;
-    public const int DefaultTurboInitialDelayMilliseconds = 180;
-    public const int DefaultTurboRepeatIntervalMilliseconds = 80;
+    public const int CurrentVersion = 4;
+    public const int DefaultTurboInitialDelayMilliseconds = 0;
+    public const int DefaultTurboRepeatIntervalMilliseconds = 60;
     public const int MinimumTurboInitialDelayMilliseconds = 0;
     public const int MaximumTurboInitialDelayMilliseconds = 1_000;
     public const int MinimumTurboRepeatIntervalMilliseconds = 60;
     public const int MaximumTurboRepeatIntervalMilliseconds = 1_000;
+
+    private const int LegacyTurboInitialDelayMilliseconds = 180;
+    private const int LegacyTurboRepeatIntervalMilliseconds = 80;
 
     private bool turboEnabled;
     private bool turboMacrosEnabled;
@@ -66,6 +69,20 @@ public sealed class PluginConfiguration : IPluginConfiguration
         if (Version <= 2)
         {
             TurboMacrosEnabled = false;
+            changed = true;
+        }
+
+        // Schema 3 shipped with a 180 ms grace period before the first Turbo
+        // attempt. Real traces showed that ordinary 97-118 ms holds therefore
+        // ended without a single pulse. Only migrate the exact old default pair;
+        // deliberate custom timings remain untouched. Readiness and the 60 ms
+        // hard cadence still gate every actual dispatch.
+        if (Version == 3
+            && TurboInitialDelayMs == LegacyTurboInitialDelayMilliseconds
+            && TurboRepeatIntervalMs == LegacyTurboRepeatIntervalMilliseconds)
+        {
+            TurboInitialDelayMs = DefaultTurboInitialDelayMilliseconds;
+            TurboRepeatIntervalMs = DefaultTurboRepeatIntervalMilliseconds;
             changed = true;
         }
 

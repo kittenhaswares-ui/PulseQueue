@@ -8,6 +8,7 @@ internal static class HoldRepeatTests
         yield return ("hold repeat keeps exactly one newest active hold", NewestFreshPressReplacesActiveHold);
         yield return ("hold repeat respects delay interval and no catch-up", DelayIntervalAndNoCatchUp);
         yield return ("hold repeat options enforce hard timing bounds", OptionsEnforceHardBounds);
+        yield return ("hold repeat defaults use immediate bounded cadence", DefaultsUseImmediateBoundedCadence);
         yield return ("hold repeat permits zero initial delay without bypassing interval", ZeroInitialDelayStillHonorsInterval);
         yield return ("racing hold ticks issue exactly one pulse token", RacingTicksIssueExactlyOnePulse);
         yield return ("release prevents every later pulse", ReleasePreventsLaterPulse);
@@ -109,6 +110,14 @@ internal static class HoldRepeatTests
         Equal(HoldRepeatOptions.MaximumInitialDelayMilliseconds, shortHold.Options.InitialDelayMilliseconds);
         Equal(HoldRepeatOptions.MaximumIntervalMilliseconds, shortHold.Options.IntervalMilliseconds);
         Equal(HoldRepeatOptions.MinimumHoldDurationMilliseconds, shortHold.Options.MaximumHoldMilliseconds);
+    }
+
+    private static void DefaultsUseImmediateBoundedCadence()
+    {
+        var defaults = HoldRepeatOptions.Default;
+        Equal(0, defaults.InitialDelayMilliseconds);
+        Equal(HoldRepeatOptions.MinimumTimingMilliseconds, defaults.IntervalMilliseconds);
+        Equal(HoldRepeatOptions.AbsoluteMaximumHoldMilliseconds, defaults.MaximumHoldMilliseconds);
     }
 
     private static void ZeroInitialDelayStillHonorsInterval()

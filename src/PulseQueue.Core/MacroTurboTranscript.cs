@@ -1,215 +1,154 @@
 namespace PulseQueue.Core;
 
 /// <summary>
-/// One ordered action line observed while executing an action-only macro. The
-/// resolved ID is retained for diagnostics and runtime eligibility checks, but
-/// it is deliberately not part of semantic transcript matching: combo or level
-/// adjustment may produce a different resolved ID on a later execution.
+/// Result of reserving one already live-validated action call in a synthetic
+/// same-slot macro execution.
 /// </summary>
-public readonly record struct MacroTurboTranscriptEntry(
-    uint ActionType,
-    uint RequestedActionId,
-    uint ResolvedActionId,
-    ulong TargetId,
-    uint ExtraParam,
-    uint RouteId,
-    ulong ResolverFingerprint)
+public enum MacroTurboActionObservationResult
 {
-    public bool IsValid =>
-        ActionType != 0
-        && RequestedActionId != 0
-        && ResolvedActionId != 0;
-
-    public bool SemanticallyMatches(MacroTurboTranscriptEntry observed) =>
-        IsValid
-        && observed.IsValid
-        && ActionType == observed.ActionType
-        && RequestedActionId == observed.RequestedActionId
-        && TargetId == observed.TargetId
-        && ExtraParam == observed.ExtraParam
-        && RouteId == observed.RouteId
-        && ResolverFingerprint == observed.ResolverFingerprint;
-}
-
-public enum MacroTurboBuildStepResult
-{
-    Appended = 0,
-    InvalidEntry,
-    ExtraEntry,
-    Closed,
-    Faulted,
-}
-
-public enum MacroTurboFreezeResult
-{
-    Frozen = 0,
-    Incomplete,
-    InvalidEntry,
-    ExtraEntry,
-    AlreadyClosed,
-}
-
-/// <summary>
-/// Builds the immutable baseline transcript for one macro. Freeze is a terminal
-/// operation and succeeds only when the observed entry count exactly equals the
-/// statically analyzed action-line count.
-/// </summary>
-public sealed class MacroTurboTranscriptBuilder
-{
-    private readonly int expectedActionCount;
-    private readonly List<MacroTurboTranscriptEntry> entries;
-    private MacroTurboFreezeResult? failure;
-    private bool closed;
-
-    public MacroTurboTranscriptBuilder(int expectedActionCount)
-    {
-        if (expectedActionCount <= 0)
-        {
-            throw new ArgumentOutOfRangeException(
-                nameof(expectedActionCount),
-                "A macro transcript must expect at least one action line.");
-        }
-
-        this.expectedActionCount = expectedActionCount;
-        entries = new List<MacroTurboTranscriptEntry>(expectedActionCount);
-    }
-
-    public int ExpectedActionCount => expectedActionCount;
-
-    public int ObservedActionCount => entries.Count;
-
-    public MacroTurboBuildStepResult Append(MacroTurboTranscriptEntry entry)
-    {
-        if (closed) return MacroTurboBuildStepResult.Closed;
-        if (failure is not null) return MacroTurboBuildStepResult.Faulted;
-        if (!entry.IsValid)
-        {
-            failure = MacroTurboFreezeResult.InvalidEntry;
-            return MacroTurboBuildStepResult.InvalidEntry;
-        }
-
-        if (entries.Count >= expectedActionCount)
-        {
-            failure = MacroTurboFreezeResult.ExtraEntry;
-            return MacroTurboBuildStepResult.ExtraEntry;
-        }
-
-        entries.Add(entry);
-        return MacroTurboBuildStepResult.Appended;
-    }
-
-    public MacroTurboFreezeResult Freeze(out MacroTurboTranscript? transcript)
-    {
-        transcript = null;
-        if (closed) return MacroTurboFreezeResult.AlreadyClosed;
-        closed = true;
-
-        if (failure is { } failed) return failed;
-        if (entries.Count != expectedActionCount)
-        {
-            return MacroTurboFreezeResult.Incomplete;
-        }
-
-        transcript = new MacroTurboTranscript(expectedActionCount, entries.ToArray());
-        return MacroTurboFreezeResult.Frozen;
-    }
-}
-
-/// <summary>
-/// Immutable ordered action-line identity captured from one complete macro
-/// execution. Duplicate entries are preserved.
-/// </summary>
-public sealed class MacroTurboTranscript
-{
-    private readonly MacroTurboTranscriptEntry[] entries;
-
-    internal MacroTurboTranscript(
-        int expectedActionCount,
-        MacroTurboTranscriptEntry[] entries)
-    {
-        if (expectedActionCount <= 0 || entries.Length != expectedActionCount)
-        {
-            throw new ArgumentException("A frozen macro transcript must be complete.", nameof(entries));
-        }
-
-        ExpectedActionCount = expectedActionCount;
-        this.entries = (MacroTurboTranscriptEntry[])entries.Clone();
-    }
-
-    public int ExpectedActionCount { get; }
-
-    public int Count => entries.Length;
-
-    public MacroTurboTranscriptEntry this[int index] => entries[index];
-
-    public MacroTurboExecutionCursor StartExecution() => new(this);
-}
-
-public enum MacroTurboExecutionAcceptResult
-{
-    Accepted = 0,
-    Mismatch,
-    Extra,
+    Allowed = 0,
+    ActionLimitExceeded,
+    AcceptedOutcomeAlreadyMarked,
     Closed,
 }
 
-public enum MacroTurboExecutionResult
+/// <summary>
+/// Result of reporting that the original native action call was accepted or
+/// queued.
+/// </summary>
+public enum MacroTurboAcceptedOutcomeMarkResult
+{
+    Marked = 0,
+    NoObservedAction,
+    AlreadyMarked,
+    Closed,
+}
+
+/// <summary>
+/// Terminal result for one synthetic same-slot macro execution.
+/// </summary>
+public enum MacroTurboExecutionBudgetResult
 {
     Complete = 0,
-    Incomplete,
-    Mismatch,
-    Extra,
+    ActionLimitExceeded,
+    ActionAfterAcceptedOutcome,
+    AcceptedOutcomeWithoutAction,
+    MultipleAcceptedOutcomes,
 }
 
 /// <summary>
-/// Ordered, fail-closed validator for one later execution of a frozen macro.
-/// Each observation may match only the next baseline entry.
+/// Fail-closed call budget for one synthetic execution of the same certified
+/// macro slot. The caller must live-validate every macro action before calling
+/// <see cref="ObserveAction"/>. An allowed observation reserves exactly one
+/// call to the native original. If that original reports an accepted or queued
+/// outcome, the caller must immediately call <see cref="MarkAcceptedOutcome"/>.
 /// </summary>
-public sealed class MacroTurboExecutionCursor
+/// <remarks>
+/// This type deliberately records only bounded execution cardinality. It does
+/// not capture or compare an action transcript, so duplicate macro action lines
+/// are counted independently. Once an accepted outcome is marked, every later
+/// action is blocked before the native original can run.
+/// </remarks>
+public sealed class MacroTurboExecutionBudget
 {
-    private readonly MacroTurboTranscript transcript;
-    private MacroTurboExecutionResult? terminalResult;
-    private int acceptedCount;
+    private readonly int maxActionCalls;
+    private MacroTurboExecutionBudgetResult? terminalResult;
+    private int observedActionCalls;
+    private int acceptedOutcomeCount;
 
-    internal MacroTurboExecutionCursor(MacroTurboTranscript transcript)
+    public MacroTurboExecutionBudget(int maxActionCalls)
     {
-        this.transcript = transcript;
+        if (maxActionCalls <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxActionCalls),
+                "A macro execution budget must allow at least one action call.");
+        }
+
+        this.maxActionCalls = maxActionCalls;
     }
 
-    public int AcceptedCount => acceptedCount;
+    public int MaxActionCalls => maxActionCalls;
 
-    public int ExpectedActionCount => transcript.ExpectedActionCount;
+    /// <summary>
+    /// Number of action calls that were allowed to proceed to the native
+    /// original. A blocked call never increments this value.
+    /// </summary>
+    public int ObservedActionCalls => observedActionCalls;
+
+    public int AcceptedOutcomeCount => acceptedOutcomeCount;
 
     public bool IsTerminal => terminalResult is not null;
 
-    public MacroTurboExecutionResult? TerminalResult => terminalResult;
+    public MacroTurboExecutionBudgetResult? TerminalResult => terminalResult;
 
-    public MacroTurboExecutionAcceptResult Accept(MacroTurboTranscriptEntry observed)
+    /// <summary>
+    /// Reserves one call to the native original after the caller has completed
+    /// all live action validation.
+    /// </summary>
+    public MacroTurboActionObservationResult ObserveAction()
     {
-        if (terminalResult is not null) return MacroTurboExecutionAcceptResult.Closed;
-        if (acceptedCount >= transcript.Count)
+        if (terminalResult is not null)
         {
-            terminalResult = MacroTurboExecutionResult.Extra;
-            return MacroTurboExecutionAcceptResult.Extra;
+            return MacroTurboActionObservationResult.Closed;
         }
 
-        if (!transcript[acceptedCount].SemanticallyMatches(observed))
+        if (acceptedOutcomeCount != 0)
         {
-            terminalResult = MacroTurboExecutionResult.Mismatch;
-            return MacroTurboExecutionAcceptResult.Mismatch;
+            terminalResult = MacroTurboExecutionBudgetResult.ActionAfterAcceptedOutcome;
+            return MacroTurboActionObservationResult.AcceptedOutcomeAlreadyMarked;
         }
 
-        acceptedCount++;
-        return MacroTurboExecutionAcceptResult.Accepted;
+        if (observedActionCalls >= maxActionCalls)
+        {
+            terminalResult = MacroTurboExecutionBudgetResult.ActionLimitExceeded;
+            return MacroTurboActionObservationResult.ActionLimitExceeded;
+        }
+
+        observedActionCalls++;
+        return MacroTurboActionObservationResult.Allowed;
     }
 
-    public MacroTurboExecutionResult Finish()
+    /// <summary>
+    /// Marks the single accepted or queued outcome produced by an allowed
+    /// native original action call.
+    /// </summary>
+    public MacroTurboAcceptedOutcomeMarkResult MarkAcceptedOutcome()
     {
-        if (terminalResult is { } terminal) return terminal;
+        if (terminalResult is not null)
+        {
+            return MacroTurboAcceptedOutcomeMarkResult.Closed;
+        }
 
-        terminalResult = acceptedCount == transcript.Count
-            ? MacroTurboExecutionResult.Complete
-            : MacroTurboExecutionResult.Incomplete;
+        if (observedActionCalls == 0)
+        {
+            terminalResult = MacroTurboExecutionBudgetResult.AcceptedOutcomeWithoutAction;
+            return MacroTurboAcceptedOutcomeMarkResult.NoObservedAction;
+        }
+
+        if (acceptedOutcomeCount != 0)
+        {
+            terminalResult = MacroTurboExecutionBudgetResult.MultipleAcceptedOutcomes;
+            return MacroTurboAcceptedOutcomeMarkResult.AlreadyMarked;
+        }
+
+        acceptedOutcomeCount = 1;
+        return MacroTurboAcceptedOutcomeMarkResult.Marked;
+    }
+
+    /// <summary>
+    /// Closes the execution. Any active execution with zero through the
+    /// configured maximum action calls and no more than one accepted outcome is
+    /// complete. Existing failures remain terminal.
+    /// </summary>
+    public MacroTurboExecutionBudgetResult Finish()
+    {
+        if (terminalResult is { } terminal)
+        {
+            return terminal;
+        }
+
+        terminalResult = MacroTurboExecutionBudgetResult.Complete;
         return terminalResult.Value;
     }
 }
