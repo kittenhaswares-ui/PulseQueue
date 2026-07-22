@@ -235,6 +235,12 @@ internal sealed class PluginCompatibilityService
             safe = false;
         }
 
+        if (configuration.MacroQueueEnabled)
+        {
+            conflicts.Add("Disable ReAction's Macro Queue; PulseQueue cannot prove exact macro ownership while ReAction rewrites macro action queue mode.");
+            safe = false;
+        }
+
         if (configuration.AutoDismountEnabled)
         {
             conflicts.Add("Disable ReAction's Auto Dismount while PulseQueue is enabled.");
@@ -329,6 +335,7 @@ internal sealed class PluginCompatibilityService
         if (!TryReadCollectionCount(configType, config, "ActionStacks", out var actionStackCount)
             || !TryReadBoolean(configType, config, "EnableAutoTarget", out var autoTargetEnabled)
             || !TryReadBoolean(configType, config, "EnableTurboHotbars", out var turboHotbarsEnabled)
+            || !TryReadBoolean(configType, config, "EnableMacroQueue", out var macroQueueEnabled)
             || !TryReadBoolean(configType, config, "EnableAutoDismount", out var autoDismountEnabled)
             || !TryReadBoolean(
                 configType,
@@ -343,6 +350,7 @@ internal sealed class PluginCompatibilityService
             actionStackCount,
             autoTargetEnabled,
             turboHotbarsEnabled,
+            macroQueueEnabled,
             autoDismountEnabled,
             cameraRelativeDirectionalsEnabled);
         return true;
@@ -499,6 +507,7 @@ internal sealed class PluginCompatibilityService
         int ActionStackCount,
         bool AutoTargetEnabled,
         bool TurboHotbarsEnabled,
+        bool MacroQueueEnabled,
         bool AutoDismountEnabled,
         bool CameraRelativeDirectionalsEnabled);
 }

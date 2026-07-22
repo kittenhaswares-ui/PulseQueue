@@ -5,7 +5,7 @@ namespace PulseQueue.Plugin.Models;
 
 public sealed class PluginConfiguration : IPluginConfiguration
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
     public const int DefaultTurboInitialDelayMilliseconds = 180;
     public const int DefaultTurboRepeatIntervalMilliseconds = 80;
     public const int MinimumTurboInitialDelayMilliseconds = 0;
@@ -14,6 +14,7 @@ public sealed class PluginConfiguration : IPluginConfiguration
     public const int MaximumTurboRepeatIntervalMilliseconds = 1_000;
 
     private bool turboEnabled;
+    private bool turboMacrosEnabled;
 
     public int Version { get; set; } = CurrentVersion;
     public bool Enabled { get; set; } = true;
@@ -23,6 +24,12 @@ public sealed class PluginConfiguration : IPluginConfiguration
     {
         get => Version <= CurrentVersion && turboEnabled;
         set => turboEnabled = value;
+    }
+
+    public bool TurboMacrosEnabled
+    {
+        get => Version <= CurrentVersion && turboMacrosEnabled;
+        set => turboMacrosEnabled = value;
     }
 
     public int TurboInitialDelayMs { get; set; } = DefaultTurboInitialDelayMilliseconds;
@@ -51,6 +58,19 @@ public sealed class PluginConfiguration : IPluginConfiguration
             TurboInitialDelayMs = DefaultTurboInitialDelayMilliseconds;
             TurboRepeatIntervalMs = DefaultTurboRepeatIntervalMilliseconds;
             TurboOutOfCombat = false;
+            changed = true;
+        }
+
+        // Macro Turbo is a separate high-impact permission. Never infer consent
+        // from an older schema where the setting did not exist.
+        if (Version <= 2)
+        {
+            TurboMacrosEnabled = false;
+            changed = true;
+        }
+
+        if (Version != CurrentVersion)
+        {
             Version = CurrentVersion;
             changed = true;
         }
@@ -76,6 +96,7 @@ public sealed class PluginConfiguration : IPluginConfiguration
         DryRun = false;
         DetailedLogging = false;
         TurboEnabled = false;
+        TurboMacrosEnabled = false;
         TurboInitialDelayMs = DefaultTurboInitialDelayMilliseconds;
         TurboRepeatIntervalMs = DefaultTurboRepeatIntervalMilliseconds;
         TurboOutOfCombat = false;
