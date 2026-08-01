@@ -5,15 +5,20 @@ internal static class LogicalHotbarRepeatTests
 {
     public static IEnumerable<(string Name, Action Body)> All()
     {
-        yield return ("logical repeat requires startup release", StartupReleaseIsRequired);
+        yield return ("logical repeat first native press claims without startup release", FirstNativePressClaims);
         yield return ("logical repeat options normalize hard timing bounds", OptionsAreNormalized);
         yield return ("logical repeat injects exactly on cadence", InjectsExactlyOnCadence);
         yield return ("logical repeat zero initial delay still waits one interval", ZeroInitialDelayWaitsOneInterval);
         yield return ("logical repeat zero interval emits at most once per scan", ZeroIntervalEmitsAtMostOncePerScan);
         yield return ("logical repeat newest physical input becomes sole owner", NewestInputBecomesSoleOwner);
+        yield return ("logical repeat newest fast tap preempts a held owner", NewestFastTapPreemptsHeldOwner);
+        yield return ("logical repeat external pulse from an older held input cannot steal ownership", ExternalPulseFromOlderHeldInputCannotStealOwner);
         yield return ("logical repeat suppresses preempted hold until its release", PreemptedHoldStaysSuppressedUntilRelease);
         yield return ("logical repeat old release preserves newest owner", OldReleasePreservesNewestOwner);
-        yield return ("logical repeat delegates to an external repeat owner", ExternalOwnerDelegatesRepeats);
+        yield return ("logical repeat observes external pulses without surrendering cadence", ExternalPulseDoesNotSurrenderCadence);
+        yield return ("logical repeat external pulses postpone but do not surrender fallback", ExternalPulsesPostponeFallback);
+        yield return ("logical repeat outer-hook execution coalesces the fallback", OuterHookExecutionCoalescesFallback);
+        yield return ("logical repeat ignored macro executions do not end the hold", IgnoredMacroExecutionsDoNotEndHold);
         yield return ("logical repeat disabled mode passes native input", DisabledRepeatPassesNativeInput);
         yield return ("logical repeat disabled newest input still preempts", DisabledNewestInputStillPreempts);
         yield return ("logical repeat release and repress creates a fresh hold", ReleaseAndRepressCreatesFreshHold);
@@ -29,7 +34,7 @@ internal static class LogicalHotbarRepeatTests
         yield return ("logical repeat randomized trace preserves invariants", RandomizedTracePreservesInvariants);
     }
 
-    private static void StartupReleaseIsRequired()
+    private static void FirstNativePressClaims()
     {
         var engine = new LogicalHotbarRepeatEngine();
 
@@ -38,22 +43,11 @@ internal static class LogicalHotbarRepeatTests
             startupPress,
             LogicalHotbarRepeatDecisionKind.PhysicalPress,
             reportPressed: true,
-            owner: 0,
-            freshPhysicalEdge: false);
-        Equal(LogicalHotbarRepeatDecisionKind.None, engine.Observe(Observation(10, false, true, 1_000)).Kind);
-        False(engine.Snapshot.HasOwner);
-
-        Decision(
-            engine.Observe(Observation(10, nativePressed: false, held: false, now: 1_001)),
-            LogicalHotbarRepeatDecisionKind.Released,
-            reportPressed: false,
-            owner: 0);
-        Decision(
-            engine.Observe(Observation(10, nativePressed: true, held: true, now: 1_002)),
-            LogicalHotbarRepeatDecisionKind.PhysicalPress,
-            reportPressed: true,
             owner: 10,
             freshPhysicalEdge: true);
+        Equal(
+            LogicalHotbarRepeatDecisionKind.InjectedRepeat,
+            engine.Observe(Observation(10, false, true, 60)).Kind);
         Equal(1L, engine.Snapshot.Counters.HoldsClaimed);
     }
 
@@ -133,6 +127,50 @@ internal static class LogicalHotbarRepeatTests
         Equal(1L, engine.Snapshot.Counters.InjectedRepeats);
     }
 
+    private static void NewestFastTapPreemptsHeldOwner()
+    {
+        var engine = ReadyEngine();
+        Press(engine, id: 1, now: 100);
+
+        Decision(
+            engine.Observe(Observation(2, nativePressed: true, held: false, now: 120)),
+            LogicalHotbarRepeatDecisionKind.PhysicalPress,
+            reportPressed: true,
+            owner: 0,
+            freshPhysicalEdge: true);
+        Decision(
+            engine.Observe(Observation(1, nativePressed: false, held: true, now: 160)),
+            LogicalHotbarRepeatDecisionKind.SuppressedOlderHold,
+            reportPressed: false,
+            owner: 0);
+        Equal(1L, engine.Snapshot.Counters.HoldsPreempted);
+        Release(engine, id: 1, now: 161);
+    }
+
+    private static void ExternalPulseFromOlderHeldInputCannotStealOwner()
+    {
+        var engine = new LogicalHotbarRepeatEngine(
+            new LogicalHotbarRepeatOptions(InitialDelayMilliseconds: 0, RepeatIntervalMilliseconds: 60));
+
+        Decision(
+            engine.Observe(Observation(1, nativePressed: true, held: true, now: 100)),
+            LogicalHotbarRepeatDecisionKind.PhysicalPress,
+            reportPressed: true,
+            owner: 1,
+            freshPhysicalEdge: true);
+        Decision(
+            engine.Observe(Observation(2, nativePressed: false, held: true, now: 110)),
+            LogicalHotbarRepeatDecisionKind.None,
+            reportPressed: false,
+            owner: 1);
+        Decision(
+            engine.Observe(Observation(2, nativePressed: true, held: true, now: 160, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.SuppressedOlderHold,
+            reportPressed: false,
+            owner: 1);
+        Equal(1L, engine.Snapshot.Counters.HoldsClaimed);
+    }
+
     private static void PreemptedHoldStaysSuppressedUntilRelease()
     {
         var engine = ReadyEngine();
@@ -153,7 +191,7 @@ internal static class LogicalHotbarRepeatTests
         Equal(3L, engine.Snapshot.Counters.HoldsClaimed);
     }
 
-    private static void ExternalOwnerDelegatesRepeats()
+    private static void ExternalPulseDoesNotSurrenderCadence()
     {
         var engine = ReadyEngine();
         var initial = engine.Observe(Observation(1, true, true, 100, externalOwner: true));
@@ -161,18 +199,101 @@ internal static class LogicalHotbarRepeatTests
 
         Equal(
             LogicalHotbarRepeatDecisionKind.None,
-            engine.Observe(Observation(1, false, true, 1_000, externalOwner: true)).Kind);
-        var delegated = engine.Observe(Observation(1, true, true, 1_001, externalOwner: true));
+            engine.Observe(Observation(1, false, true, 159, externalOwner: true)).Kind);
+        var delegated = engine.Observe(Observation(1, true, true, 160, externalOwner: true));
         Decision(delegated, LogicalHotbarRepeatDecisionKind.DelegatedRepeat, true, 1);
         Equal(0L, delegated.Counters.InjectedRepeats);
         Equal(1L, delegated.Counters.DelegatedRepeats);
 
         Equal(
             LogicalHotbarRepeatDecisionKind.None,
-            engine.Observe(Observation(1, false, true, 1_060, externalOwner: false)).Kind);
+            engine.Observe(Observation(1, false, true, 160, externalOwner: true)).Kind);
+        Equal(
+            LogicalHotbarRepeatDecisionKind.None,
+            engine.Observe(Observation(1, false, true, 219, externalOwner: true)).Kind);
         Equal(
             LogicalHotbarRepeatDecisionKind.InjectedRepeat,
-            engine.Observe(Observation(1, false, true, 1_061, externalOwner: false)).Kind);
+            engine.Observe(Observation(1, false, true, 220, externalOwner: true)).Kind);
+        Equal(1L, engine.Snapshot.Counters.InjectedRepeats);
+    }
+
+    private static void ExternalPulsesPostponeFallback()
+    {
+        var engine = ReadyEngine();
+        Decision(
+            engine.Observe(Observation(1, true, true, 100, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.PhysicalPress,
+            reportPressed: true,
+            owner: 1,
+            freshPhysicalEdge: true);
+
+        foreach (var now in new long[] { 120, 140, 159 })
+        {
+            Decision(
+                engine.Observe(Observation(1, true, true, now, externalOwner: true)),
+                LogicalHotbarRepeatDecisionKind.DelegatedRepeat,
+                reportPressed: true,
+                owner: 1);
+        }
+
+        Decision(
+            engine.Observe(Observation(1, false, true, 160, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.None,
+            reportPressed: false,
+            owner: 1);
+        Decision(
+            engine.Observe(Observation(1, false, true, 218, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.None,
+            reportPressed: false,
+            owner: 1);
+        Decision(
+            engine.Observe(Observation(1, false, true, 219, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.InjectedRepeat,
+            reportPressed: true,
+            owner: 1);
+    }
+
+    private static void OuterHookExecutionCoalescesFallback()
+    {
+        var engine = ReadyEngine();
+        Press(engine, id: 1, now: 100);
+
+        True(engine.CoalesceExternalExecution(logicalInputId: 1, nowMilliseconds: 150));
+        Decision(
+            engine.Observe(Observation(1, false, true, 160, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.None,
+            reportPressed: false,
+            owner: 1);
+        Decision(
+            engine.Observe(Observation(1, false, true, 210, externalOwner: true)),
+            LogicalHotbarRepeatDecisionKind.InjectedRepeat,
+            reportPressed: true,
+            owner: 1);
+
+        False(engine.CoalesceExternalExecution(logicalInputId: 2, nowMilliseconds: 211));
+        Equal(1L, engine.Snapshot.OwnerLogicalInputId);
+    }
+
+    private static void IgnoredMacroExecutionsDoNotEndHold()
+    {
+        var engine = new LogicalHotbarRepeatEngine(new LogicalHotbarRepeatOptions(0, 60));
+        Press(engine, id: 91, now: 0);
+
+        foreach (var now in new long[] { 60, 120, 180 })
+        {
+            Decision(
+                engine.Observe(Observation(91, false, true, now)),
+                LogicalHotbarRepeatDecisionKind.InjectedRepeat,
+                reportPressed: true,
+                owner: 91);
+        }
+
+        Release(engine, id: 91, now: 181);
+        Decision(
+            engine.Observe(Observation(91, false, false, 240)),
+            LogicalHotbarRepeatDecisionKind.None,
+            reportPressed: false,
+            owner: 0);
     }
 
     private static void OldReleasePreservesNewestOwner()
@@ -450,7 +571,6 @@ internal static class LogicalHotbarRepeatTests
                 False(observation.NativePressed);
                 True(observation.Held);
                 True(observation.RepeatEnabled);
-                False(observation.ExternalRepeatOwnerActive);
                 True(decision.OwnerLogicalInputId == observation.LogicalInputId);
                 True(decision.ShouldReportPressed);
             }

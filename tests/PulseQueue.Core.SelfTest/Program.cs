@@ -32,8 +32,8 @@ internal static class SelfTests
             ("runtime eligibility is required", RuntimeEligibilityIsRequired),
             ("dispatch happens exactly once", DispatchHappensExactlyOnce),
             ("dispatch preserves exact action and target", DispatchPreservesExactAction),
-            ("expiry wins at the 180ms boundary", ExpiryWinsAtAbsoluteBoundary),
-            ("buffer expires after 180ms", BufferExpiresAfterAbsoluteCap),
+            ("expiry wins at the absolute boundary", ExpiryWinsAtAbsoluteBoundary),
+            ("buffer expires after the absolute cap", BufferExpiresAfterAbsoluteCap),
             ("late rejection cannot arm", LateRejectionCannotArm),
             ("eligibility beyond cap cannot arm", EligibilityBeyondCapCannotArm),
             ("deadline is anchored to original press", DeadlineAnchoredToOriginalPress),
@@ -250,21 +250,21 @@ internal static class SelfTests
 
     private static void ExpiryWinsAtAbsoluteBoundary()
     {
-        var buffer = ArmedBuffer(eligibleAt: T0 + Ms(179));
-        False(Take(buffer, T0 + Ms(180)));
+        var buffer = ArmedBuffer(eligibleAt: T0 + OneShotActionBuffer.AbsoluteHoldCap - Ms(1));
+        False(Take(buffer, T0 + OneShotActionBuffer.AbsoluteHoldCap));
         Equal(BufferClearReason.Expired, buffer.LastClearReason);
 
         var second = new OneShotActionBuffer();
         var token = Begin(second);
         Equal(
             ArmResult.RejectedBeyondAbsoluteHoldCap,
-            Reject(second, token, ActionFailureKind.GlobalCooldown, T0 + Ms(180)));
+            Reject(second, token, ActionFailureKind.GlobalCooldown, T0 + OneShotActionBuffer.AbsoluteHoldCap));
     }
 
     private static void BufferExpiresAfterAbsoluteCap()
     {
         var buffer = ArmedBuffer();
-        False(Take(buffer, T0 + Ms(181)));
+        False(Take(buffer, T0 + OneShotActionBuffer.AbsoluteHoldCap + Ms(1)));
         Equal(BufferLifecycleState.Idle, buffer.State);
         Equal(BufferClearReason.Expired, buffer.LastClearReason);
     }
@@ -279,8 +279,8 @@ internal static class SelfTests
                 buffer,
                 token,
                 ActionFailureKind.GlobalCooldown,
-                T0 + Ms(181),
-                observedAt: T0 + Ms(181)));
+                T0 + OneShotActionBuffer.AbsoluteHoldCap + Ms(1),
+                observedAt: T0 + OneShotActionBuffer.AbsoluteHoldCap + Ms(1)));
     }
 
     private static void EligibilityBeyondCapCannotArm()
@@ -289,7 +289,11 @@ internal static class SelfTests
         var token = Begin(buffer);
         Equal(
             ArmResult.RejectedBeyondAbsoluteHoldCap,
-            Reject(buffer, token, ActionFailureKind.GlobalCooldown, T0 + Ms(181)));
+            Reject(
+                buffer,
+                token,
+                ActionFailureKind.GlobalCooldown,
+                T0 + OneShotActionBuffer.AbsoluteHoldCap + Ms(1)));
     }
 
     private static void DeadlineAnchoredToOriginalPress()
@@ -302,9 +306,9 @@ internal static class SelfTests
                 buffer,
                 token,
                 ActionFailureKind.GlobalCooldown,
-                T0 + Ms(179),
-                observedAt: T0 + Ms(170)));
-        False(Take(buffer, T0 + Ms(180)));
+                T0 + OneShotActionBuffer.AbsoluteHoldCap - Ms(1),
+                observedAt: T0 + OneShotActionBuffer.AbsoluteHoldCap - Ms(10)));
+        False(Take(buffer, T0 + OneShotActionBuffer.AbsoluteHoldCap));
     }
 
     private static void SafetyConditionClears(

@@ -88,7 +88,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
     private const ulong InvalidObjectId = 0xE0000000;
     private const ushort StunStatusId = 2;
     private const double AnimationLockEpsilonSeconds = 0.0005;
-    private const long MaximumFrameGapMilliseconds = 100;
+    private const long MaximumFrameGapMilliseconds = 1_000;
     private const long MaximumTimingSampleAgeMilliseconds = 2_000;
     private const long MaximumRecentActionEffectAgeMilliseconds = 2_000;
     private const int MaximumActionEffectTargets = 32;
@@ -455,10 +455,16 @@ internal sealed unsafe class ActionBufferService : IDisposable
         }
     }
 
-    private static bool RequiresNativeInputRelease(CancelReason reason) => reason is not (
-        CancelReason.None or
-        CancelReason.Replaced or
-        CancelReason.Dispatched);
+    private static bool RequiresNativeInputRelease(CancelReason reason) => reason is
+        CancelReason.Explicit or
+        CancelReason.Disabled or
+        CancelReason.Logout or
+        CancelReason.Death or
+        CancelReason.Mounted or
+        CancelReason.Stun or
+        CancelReason.Knockback or
+        CancelReason.TerritoryChange or
+        CancelReason.InstanceChange;
 
     public void ClearFaultForReload()
     {
@@ -724,10 +730,10 @@ internal sealed unsafe class ActionBufferService : IDisposable
             && !replaying
             && !turboDispatching;
         var sequenceBefore = thisPtr == null ? (ushort)0 : thisPtr->LastUsedActionSequence;
-        var nativeMode = mode == ActionManager.UseActionMode.Macro
-            && CanOwnNativeMacroQueue()
-                ? ActionManager.UseActionMode.None
-                : mode;
+        // Repeated macro slots stay completely native. Rewriting Macro to None
+        // added a second policy layer that could reject every macro before FFXIV
+        // got to apply its own MacroLocked behavior.
+        var nativeMode = mode;
 
         if (!suppressSyntheticMacroCall
             && !logicalRepeatInput
@@ -1460,27 +1466,20 @@ internal sealed unsafe class ActionBufferService : IDisposable
         // being erased by the next press.
         ObserveNativeInputContextTransitions();
 
-        var liveReActionProfileCurrent = !reActionLoaded
-            || reActionAudited && compatibility.IsLiveReActionProfileCurrent();
         var pluginOperational = configuration.Enabled
             && !faulted
             && !disposed;
         var featureEnabled = pluginOperational
             && configuration.TurboEnabled
             && !configuration.DryRun
-            && activeConflicts.Count == 0
-            && compatibilityQuarantineFrames == 0
-            && IsNativeRepeatOwnershipAllowedNow()
-            && liveReActionProfileCurrent
-            && (!reActionLoaded || reActionAudited)
-            && !reActionSmartActionTransformActive;
+            && IsNativeRepeatOwnershipAllowedNow();
         var repeatEnabled = featureEnabled
             && (configuration.TurboOutOfCombat || condition[ConditionFlag.InCombat]);
         var reActionRepeatActive = pluginOperational
             && !configuration.DryRun
             && reActionLoaded
             && (!reActionAudited
-                || !liveReActionProfileCurrent
+                || !compatibility.IsLiveReActionProfileCurrent()
                 || Volatile.Read(ref reActionTurboHotbarsEnabled)
                     && (condition[ConditionFlag.InCombat]
                         || Volatile.Read(ref reActionTurboHotbarsOutOfCombatEnabled)));
@@ -1499,8 +1498,6 @@ internal sealed unsafe class ActionBufferService : IDisposable
             && !configuration.DryRun
             && !faulted
             && !disposed
-            && activeConflicts.Count == 0
-            && compatibilityQuarantineFrames == 0
             && clientState.IsLoggedIn
             && local is { IsDead: false }
             && !condition[ConditionFlag.Unconscious]
@@ -1687,20 +1684,6 @@ internal sealed unsafe class ActionBufferService : IDisposable
             nativeMacroRepeatTail = null;
         }
     }
-
-    private bool CanOwnNativeMacroQueue() =>
-        configuration.Enabled
-        && configuration.TurboMacrosEnabled
-        && !configuration.DryRun
-        && !faulted
-        && !disposed
-        && activeConflicts.Count == 0
-        && compatibilityQuarantineFrames == 0
-        && (!reActionLoaded
-            || reActionAudited
-                && compatibility.IsLiveReActionProfileCurrent()
-                && !reActionMacroQueueEnabled
-                && !reActionSmartActionTransformActive);
 
     private LogicalRepeatQueueAttempt? TryCreateLogicalRepeatQueueAttempt(
         NativeLogicalRepeatExecutionScope? execution,
@@ -5546,7 +5529,7 @@ internal sealed unsafe class ActionBufferService : IDisposable
             ObserveNativeInputContextTransitions();
             if (frameGap < 0 || frameGap > MaximumFrameGapMilliseconds)
             {
-                Cancel(CancelReason.Expired, $"Cancelled native input ownership after {frameGap} ms frame gap");
+                Cancel(CancelReason.Expired, $"Cleared smart-buffer intent after {frameGap} ms frame gap");
                 return;
             }
 
@@ -6810,15 +6793,15 @@ internal sealed unsafe class ActionBufferService : IDisposable
         if (telemetry.OwnerLogicalInputId > 0)
         {
             var owner = $"hotbar {telemetry.OwnerHotbarId + 1}, slot {telemetry.OwnerSlotId + 1}";
-            return telemetry.Settings.ExternalRepeatOwnerActive
-                ? $"Holding {owner} - repeats delegated to ReAction"
-                : telemetry.Settings.RepeatEnabled
-                    ? $"Holding {owner} - PulseQueue native repeats active"
-                    : $"Holding {owner} - waiting for combat policy";
+            return telemetry.Settings.RepeatEnabled
+                ? telemetry.Settings.ExternalRepeatOwnerActive
+                    ? $"Holding {owner} - PulseQueue cadence + ReAction passthrough"
+                    : $"Holding {owner} - PulseQueue native repeats active"
+                : $"Holding {owner} - waiting for combat policy";
         }
 
         return Volatile.Read(ref reActionTurboHotbarsEnabled)
-            ? "Ready - ReAction repeat ownership detected"
+            ? "Ready - PulseQueue cadence with ReAction passthrough"
             : "Ready - PulseQueue native repeat ownership available";
     }
 

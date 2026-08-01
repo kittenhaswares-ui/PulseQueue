@@ -258,8 +258,9 @@ internal sealed class PluginCompatibilityService
         SetLiveReActionGuard(liveConfiguration, configuration);
 
         // ReAction features are capabilities, not global compatibility gates.
-        // The action layer decides per input whether to delegate repetition,
-        // defer macro handling, or retain PulseQueue ownership.
+        // The native-input layer observes ReAction pulses while retaining its
+        // own same-input fallback; the action layer keeps smart mutations
+        // separate from native cadence.
         integrations.Add(
             $"ReAction {SupportedReActionVersion} (audited; "
             + $"Turbo Hotbars={FormatCapability(configuration.TurboHotbarsEnabled)}, "

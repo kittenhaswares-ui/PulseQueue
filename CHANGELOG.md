@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.5.0 — 2026-08-01
+
+- Fixes the exact live ReAction compatibility failure: PulseQueue previously
+  treated ReAction Turbo as the global repeat owner and disabled its own cadence.
+  PulseQueue therefore inherited ReAction's exclusions, which made Shadowbringer
+  work while combo slots and all tested macro slots remained inert.
+- Keeps PulseQueue's same-`InputId` cadence as a gap-filler. Every observed
+  current-owner ReAction/native pulse resets PulseQueue's fallback to one repeat
+  interval later. PulseQueue stays silent while ReAction pulses and resumes
+  after its last pulse. Outer-hook delegated slot execution is correlated and
+  coalesced so the same cadence event does not trigger an immediate fallback.
+- Removes ReAction audit, Auto Target/Action Stacks, compatibility-conflict and
+  one-frame quarantine gates from native held-input repetition. Those checks can
+  still protect smart action/queue mutation, but they cannot turn off repeating
+  the player's same logical hotbar input.
+- Lets the first observed native press claim repeat ownership without requiring a
+  prior startup release observation. A continuously held input that already lost
+  to a newer physical press remains suppressed until its real release.
+- Preserves native Macro action mode and repeats the entire authored hotbar slot.
+  PulseQueue no longer performs its optional Macro-to-normal mode conversion;
+  FFXIV's own `MacroLocked` state decides when the next complete macro can start.
+- Widens exact input-to-slot activation correlation from 50 to 250 ms, tolerates
+  one-second frame hitches, and stops compatibility refreshes from release-gating
+  the otherwise valid native repeat owner.
+- Target changes still cancel the exact one-shot smart-buffer token, but no
+  longer release-gate native held-input Turbo. ReAction Auto Target can therefore
+  update resolution without killing a valid combo hold.
+- Raises the adaptive one-shot smart-buffer hard maximum from 180 to 350 ms so a
+  high-latency player can retain one exact early input longer. It remains one
+  input, one exact action at most once: no FIFO, alternate skill, target change,
+  or server-rejection retry is introduced.
+
 ## 0.3.4.0 — 2026-07-22
 
 - Replaces the 0.3.3 manual Turbo implementation. Live evidence showed that

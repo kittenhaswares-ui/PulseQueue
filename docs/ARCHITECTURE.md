@@ -1,4 +1,4 @@
-# PulseQueue 0.3.4 architecture
+# PulseQueue 0.3.5 architecture
 
 ## Objective
 
@@ -13,11 +13,12 @@ responsiveness, but a later Recuperate, Purify, Guard, or other standard-hotbar
 press must immediately cancel the older pending intent and prevent the older
 held input from returning.
 
-Version 0.3.4 is a replacement architecture, not an extension of 0.3.3's manual
-Turbo runtime. The 0.3.3 live sample found 155 ReAction compatibility rejections,
-21 manual macro pulses with no observed actions, and only two direct pulses.
-The active 0.3.4 repeat path has no manual slot/action/macro dispatcher and no
-action-effect acknowledgement gate.
+Version 0.3.4 replaced 0.3.3's manual Turbo runtime. The historical 0.3.3 live
+sample found 155 ReAction compatibility rejections, 21 manual macro pulses with
+no observed actions, and only two direct pulses. Version 0.3.5 removes the last
+global-delegation gate: PulseQueue now retains a same-`InputId` gap-filler when
+ReAction Turbo is active. The active repeat path has no manual slot/action/macro
+dispatcher and no action-effect acknowledgement gate.
 
 ## Two independent layers
 
@@ -26,7 +27,7 @@ action-effect acknowledgement gate.
 The smart buffer observes a genuine action attempt after vanilla has received
 it. If the client did not accept or queue the action, and the failure is only a
 short local readiness boundary, it can retain one immutable action intent for
-at most 180 ms and issue one queue-mode call when ready.
+at most 350 ms and issue one queue-mode call when ready.
 
 The pending state is a single replaceable token, not a FIFO:
 
@@ -81,7 +82,7 @@ The dependency-free repeat engine accepts these facts for one logical input:
 - native `held` result;
 - monotonic time;
 - whether PulseQueue repeat is enabled; and
-- whether an external repeat owner is active.
+- whether the native pressed result may have been produced by ReAction.
 
 It returns one of the following decisions:
 
@@ -89,19 +90,25 @@ It returns one of the following decisions:
 |---|---|
 | `PhysicalPress` | A genuine fresh native edge passes through and becomes the newest owner. |
 | `InjectedRepeat` | PulseQueue reports the same owning `InputId` pressed for one due interval. |
-| `DelegatedRepeat` | ReAction already produced/owns this held-input pulse; PulseQueue does not inject another. |
+| `DelegatedRepeat` | ReAction already produced this held-input pulse for this scan. It passes through and resets PulseQueue's fallback deadline. |
 | `SuppressedOlderHold` | The input is still held but lost to a newer physical owner. Its pressed result is forced false where hook order permits. |
 | `Released` | The input is no longer held. Its ownership/tombstone state is cleared. |
 | `None` | No new press is reported. |
 
 Important state rules:
 
-- A key already held when the hook starts cannot silently acquire repeat
-  ownership. A release followed by a fresh press is required.
+- The first eligible native press can claim repeat ownership; no prior startup
+  release observation is required.
 - A genuine new edge always passes through, even if repeat is disabled.
-- The newest genuine edge atomically owns repeat and preempts the older owner.
+- The newest genuine edge atomically preempts the older owner. A held press
+  becomes the new repeat owner; a fast tap still suppresses the older hold.
 - A preempted input remains suppressed while continuously held. It cannot
   regain ownership merely because the newer key was released.
+- A native/ReAction pulse from another input that was already known held cannot
+  steal ownership from the newest input.
+- Every observed current-owner ReAction/native pulse resets PulseQueue's fallback
+  deadline to `now + interval`. PulseQueue is a gap-filler: it stays silent while
+  ReAction pulses and emits only after one complete interval without a pulse.
 - Each cadence emits at most one press. Large time jumps advance to one future
   due time and never create a catch-up burst.
 - Initial delay and interval are normalized independently to 0..1000 ms.
@@ -117,16 +124,16 @@ follows in the same native scan. The activation carries one of three kinds:
 
 - genuine physical press;
 - PulseQueue-injected repeat; or
-- ReAction-delegated repeat.
+- external/ReAction repeat.
 
 That distinction is the boundary between player priority and repetition:
 
 - only a genuine physical activation advances the newest-input generation,
   cancels the previous smart-buffer token, and requests an exact owned-queue
   preemption;
-- an injected or delegated repeat reaches vanilla execution but does not begin
+- an injected or external repeat reaches vanilla execution but does not begin
   a new player generation and cannot cancel a newer buffer token; and
-- a delegated repeat from a superseded continuously held input is suppressed at
+- an external repeat from a superseded continuously held input is suppressed at
   the exact correlated slot boundary when outer hook order prevents suppression
   at `IsInputIDPressed` itself.
 
@@ -166,37 +173,39 @@ This power is also a user-visible risk: chat, target, marker, gearset, sound, or
 other commands in a held macro can run on every native repeat. PulseQueue does
 not silently remove them.
 
-Macro action queueing is a separate opt-in. When enabled and when ReAction Macro
-Queue is not active, an action call made in native Macro mode is passed to the
-single original `UseAction` boundary in normal queueable mode. All other
-arguments remain unchanged. The conversion does not parse the macro, create a
-second macro executor, or make the macro itself repeat.
+PulseQueue preserves native Macro action mode. FFXIV's own `MacroLocked` state
+governs whether the complete slot can begin another execution. If ReAction
+Macro Queue is enabled, it may transform Macro mode downstream; PulseQueue has
+no separate Macro Queue switch, command, or conversion owner.
 
 ## ReAction integration
 
 Compatibility is capability-granular:
 
-- **Turbo Hotbars active:** PulseQueue marks ReAction as the external repeat
-  owner. It observes and classifies native held pulses but does not inject a
-  second pulse stream.
-- **Turbo Hotbars inactive or ReAction absent:** PulseQueue's logical repeat
-  engine supplies the held press.
-- **Macro Queue active:** ReAction owns Macro-to-normal action-mode conversion;
-  PulseQueue leaves it alone.
-- **Macro Queue inactive or ReAction absent:** PulseQueue may perform its own
-  optional conversion.
+- **Turbo Hotbars active:** ReAction pulses pass through and are classified as
+  external. PulseQueue keeps a same-`InputId` gap-filler, including for combo and
+  macro bindings that ReAction stops repeating. Each current-owner external
+  pulse postpones the fallback by one interval.
+- **Turbo Hotbars inactive or ReAction absent:** the same PulseQueue logical
+  repeat engine supplies held presses without external pulses.
+- **Macro Queue active:** PulseQueue preserves native Macro mode and ReAction
+  may transform it downstream.
+- **Macro Queue inactive or ReAction absent:** PulseQueue still preserves native
+  Macro mode; FFXIV `MacroLocked` remains authoritative.
 
-Supported ReAction features are integrations, not global conflicts. A loaded
-unsupported or unreadable ReAction build is fail-closed for PulseQueue cadence,
-smart replay, and macro-mode mutation so two unknown hook owners cannot compete;
-native/ReAction input remains pass-through. Removing ReAction restores the
-standalone PulseQueue path.
+Supported ReAction features are integrations, not global conflicts. Auto Target
+and Action Stacks do not gate native same-`InputId` cadence. A loaded unsupported
+or unreadable ReAction build may fail closed for smart action/queue mutation,
+but it cannot disable action-agnostic native cadence.
 
 Hook order can vary. PulseQueue therefore classifies an external `pressed`
-signal on an input that remained held since its previous observation as a
-delegated repeat, not a fresh physical decision. It also leaves an exact
-scan-scoped slot candidate so an outer ReAction hook can be classified after it
-turns PulseQueue's false return into a held pulse.
+signal on an input that remained held since its previous observation as an
+external repeat, not a fresh physical decision. Such an older held pulse cannot
+steal ownership. PulseQueue also leaves an exact scan-scoped slot candidate so
+an outer ReAction hook can be classified after it turns PulseQueue's false
+return into a held pulse. If the outer hook produces delegated `ExecuteSlot`
+after PulseQueue's pressed detour returns, the exact slot correlation coalesces
+that execution into the same cadence observation and resets the fallback too.
 
 ## NoClippy integration
 
@@ -218,10 +227,13 @@ A genuine newer physical edge performs ordering before the new slot runs:
 6. consider the new action for a fresh one-shot buffer only after its original
    native outcome is known.
 
-Terminal events cancel pending work: death, stun, forced movement/knockback,
-mounting, target/context change, zoning, logout, job/PvP change, unsafe frame
-gap, disable, and disposal. Hook teardown stops input injection before managed
-state is released.
+Terminal events cancel pending one-shot work: death, stun, forced
+movement/knockback, mounting, target/context change, zoning, logout, job/PvP
+change, an unsafe frame gap over 1000 ms, disable, and disposal. Target changes
+do not release-gate a valid native held-input owner; this keeps ReAction Auto
+Target from killing combo cadence. A frame gap does not turn an existing hold
+into a new player press and never creates a catch-up burst. Hook teardown stops
+input injection before managed state is released.
 
 Accepted vanilla queue state is not cleared merely because a repeat key was
 released or Turbo was disabled. Exact queue clearing is reserved for newer-input
@@ -233,21 +245,23 @@ Live diagnostics distinguish:
 
 - physical logical edges;
 - PulseQueue-injected repeats;
-- ReAction-delegated repeats;
+- external/ReAction repeats;
 - releases and newest-owner preemptions;
 - suppressed older held inputs;
 - fail-open events; and
 - the current logical input/hotbar/slot owner.
 
 The counters make a short test falsifiable. A working standalone hold must show
-physical edges followed by injected repeats. With ReAction Turbo active it must
-show delegated repeats and zero duplicate PulseQueue injection. A later heal or
+physical edges followed by injected repeats. With ReAction Turbo active,
+PulseQueue stays silent while current-owner external pulses arrive and resumes
+one interval after the last pulse. Outer-hook delegated slot execution must be
+coalesced rather than followed by an immediate fallback. A later heal or
 defensive press must show one physical preemption while the old held input moves
 only the suppression counter.
 
 ## Scope and non-goals
 
-Version 0.3.4 repeat scope is the ten standard hotbars. Cross-hotbar/controller
+Version 0.3.5 repeat scope is the ten standard hotbars. Cross-hotbar/controller
 input, direct mouse clicks on a slot, and plugin-originated direct slot/action
 calls have no held standard-hotbar `InputId` in this path and do not receive
 Turbo.
