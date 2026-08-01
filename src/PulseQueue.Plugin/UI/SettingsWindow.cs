@@ -79,24 +79,12 @@ internal sealed class SettingsWindow : Window
                 "Allow Turbo outside combat",
                 configuration.TurboOutOfCombat,
                 value => configuration.TurboOutOfCombat = value);
-            DrawCheckbox(
-                "Queue actions invoked by macros",
-                configuration.TurboMacrosEnabled,
-                value => configuration.TurboMacrosEnabled = value);
-            ImGui.TextDisabled("Native Turbo repeats the complete held slot, including arbitrary or multi-command macros, regardless of this checkbox. This checkbox controls only the queue mode used by action calls inside macros.");
-            if (configuration.TurboMacrosEnabled)
-            {
-                ImGui.TextWrapped("When ReAction Macro Queue is not active, action calls made by macros use FFXIV's normal queue mode. PulseQueue does not parse the macro, choose a line, or change its target.");
-            }
-            else
-            {
-                ImGui.TextDisabled("This setting controls macro action queueing, not whether a held macro slot repeats.");
-            }
+            ImGui.TextDisabled("Macro slots are always included. PulseQueue repeats the complete slot and preserves native Macro mode; FFXIV decides when MacroLocked permits the next execution.");
         }
         ImGui.TextWrapped($"Turbo: {diagnostics.TurboStatus}");
         ImGui.TextDisabled("Current scope: logical inputs scanned for standard hotbars. Cross-hotbar/controller Turbo is not implemented yet. Directly clicking a slot has no held logical input to repeat.");
         ImGui.TextDisabled("Held macro slots repeat the entire authored macro through FFXIV. Commands and side effects in that macro can therefore run again; you control its contents.");
-        ImGui.TextDisabled("ReAction Turbo Hotbars may stay on: PulseQueue detects it and delegates repeats instead of creating a second repeat stream. ReAction Macro Queue likewise owns macro queueing when enabled. NoClippy is compatible and may stay on.");
+        ImGui.TextDisabled("ReAction Turbo Hotbars may stay on: its pulses pass through, while PulseQueue keeps an independent same-input fallback cadence for unsupported combo and macro slots. NoClippy remains untouched.");
 
         ImGui.Spacing();
         if (ImGui.Button("Clear pending smart-buffer input"))
@@ -115,11 +103,11 @@ internal sealed class SettingsWindow : Window
         ImGui.BulletText("Each due interval can report one press; missed intervals never produce a catch-up burst.");
         ImGui.BulletText("FFXIV resolves the binding, slot, adjusted action, target, and macro at the moment of each press.");
         ImGui.BulletText("A held macro slot reruns the complete unchanged macro. PulseQueue does not whitelist, rewrite, or suppress its commands.");
-        ImGui.BulletText("Macro action queueing changes only the action-call queue mode when ReAction Macro Queue is not already active.");
-        ImGui.BulletText("ReAction can own Turbo or Macro Queue without disabling PulseQueue's separate smart buffer.");
+        ImGui.BulletText("PulseQueue does not convert Macro action mode. ReAction Macro Queue may still transform it downstream if enabled.");
+        ImGui.BulletText("ReAction pulses pass through, but cannot switch off PulseQueue's independent same-input fallback cadence.");
         ImGui.BulletText("NoClippy may own animation-lock timing; PulseQueue does not write animation lock.");
         ImGui.BulletText("Turbo currently covers standard hotbar logical inputs, not cross-hotbar/controller input.");
-        ImGui.TextWrapped("The one-shot smart-buffer hold window is learned from your own acknowledged action timing, stays between 80 and 180 ms after warm-up, and never decides whether an action is legal.");
+        ImGui.TextWrapped("The one-shot smart-buffer hold window is learned from your own acknowledged action timing, stays between 80 and 350 ms after warm-up, and never decides whether an action is legal.");
 
         ImGui.Separator();
         ImGui.TextDisabled("Live diagnostics");

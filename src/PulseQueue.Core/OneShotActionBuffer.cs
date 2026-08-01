@@ -2,7 +2,7 @@ namespace PulseQueue.Core;
 
 public sealed class OneShotActionBuffer
 {
-    public static readonly TimeSpan AbsoluteHoldCap = TimeSpan.FromMilliseconds(180);
+    public static readonly TimeSpan AbsoluteHoldCap = TimeSpan.FromMilliseconds(350);
 
     private readonly object gate = new();
     private long nextAttemptValue;

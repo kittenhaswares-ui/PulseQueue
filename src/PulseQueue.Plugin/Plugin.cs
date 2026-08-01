@@ -60,7 +60,7 @@ public sealed class Plugin : IDalamudPlugin
 
         commandManager.AddHandler(Command, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open PulseQueue settings. Subcommands: on, off, status, turbo on|off, turbo macros on|off, dry on|off, log on|off, cancel, reset, help. 'turbo macros' controls macro action queueing.",
+            HelpMessage = "Open PulseQueue settings. Subcommands: on, off, status, turbo on|off, dry on|off, log on|off, cancel, reset, help. Native Turbo always includes complete macro slots.",
         });
 
         pluginInterface.UiBuilder.Draw += Draw;
@@ -151,17 +151,6 @@ public sealed class Plugin : IDalamudPlugin
                 configuration.DryRun = dryRun;
                 ApplyConfiguration($"Dry run {(dryRun ? "enabled" : "disabled")}");
                 break;
-            case "turbo" when TryReadNestedToggle(words, "macros", out var turboMacros):
-                if (configuration.Version > PluginConfiguration.CurrentVersion)
-                {
-                    chatGui.PrintError(
-                        "[PulseQueue] Macro action queueing remains off because this configuration was written by a newer plugin. Update PulseQueue or use Reset only if you intentionally want to replace that newer configuration.");
-                    break;
-                }
-
-                configuration.TurboMacrosEnabled = turboMacros;
-                ApplyConfiguration($"Macro action queueing {(turboMacros ? "enabled" : "disabled")}");
-                break;
             case "turbo" when TryReadToggle(words, out var turbo):
                 if (configuration.Version > PluginConfiguration.CurrentVersion)
                 {
@@ -218,13 +207,13 @@ public sealed class Plugin : IDalamudPlugin
             + $"captured={value.Captured}, dispatched={value.Dispatched}, rejected={value.ReplayRejected}; "
             + $"inputs={value.ObservedHotbarInputs}, replaced={value.ReplacedPendingInputs}; "
             + $"nativeQ={value.NativeQueueAccepted}/{value.NativeQueueBlocked}/{value.OwnedNativeQueueReplacements} smart-replaced/{value.OwnedNativeQueueSafetyClears} safety-cleared, repeat={value.RepeatNativeQueueClaims} claimed/{value.RepeatNativeQueueReplacements} replaced; "
-            + $"nativeInput={value.TurboState}, physical/injected/delegated={value.TurboPhysicalPresses}/{value.TurboInjectedRepeats}/{value.TurboDelegatedRepeats}, preempted={value.TurboPreemptions}, suppressed-held={value.TurboSuppressedHeldRepeats}, fail-open={value.TurboFailedOpenEvents}, {value.TurboStatus}, macroQueue={(configuration.TurboMacrosEnabled ? "on" : "off")}; "
+            + $"nativeInput={value.TurboState}, physical/injected/external={value.TurboPhysicalPresses}/{value.TurboInjectedRepeats}/{value.TurboDelegatedRepeats}, preempted={value.TurboPreemptions}, suppressed-held={value.TurboSuppressedHeldRepeats}, fail-open={value.TurboFailedOpenEvents}, {value.TurboStatus}; "
             + $"integrations={integrations}; conflicts={conflicts}; last={value.LastEvent}");
     }
 
     private void PrintHelp(bool error = false)
     {
-        const string text = "Usage: /pulsequeue [on|off|status|turbo on|off|turbo macros on|off|dry on|off|log on|off|cancel|reset|help]. 'turbo macros' toggles macro action queueing; holding a macro repeats the complete slot whenever native Turbo is on. /pulsequeue opens settings.";
+        const string text = "Usage: /pulsequeue [on|off|status|turbo on|off|dry on|off|log on|off|cancel|reset|help]. Native Turbo always includes complete macro slots. /pulsequeue opens settings.";
         if (error) chatGui.PrintError($"[PulseQueue] {text}");
         else chatGui.Print($"[PulseQueue] {text}");
     }
@@ -242,23 +231,4 @@ public sealed class Plugin : IDalamudPlugin
         return words[1].Equals("off", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool TryReadNestedToggle(
-        IReadOnlyList<string> words,
-        string name,
-        out bool value)
-    {
-        value = false;
-        if (words.Count != 3 || !words[1].Equals(name, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        if (words[2].Equals("on", StringComparison.OrdinalIgnoreCase))
-        {
-            value = true;
-            return true;
-        }
-
-        return words[2].Equals("off", StringComparison.OrdinalIgnoreCase);
-    }
 }

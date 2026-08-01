@@ -74,9 +74,11 @@ public readonly record struct LogicalHotbarRepeatSnapshot(
 /// <summary>
 /// Dependency-free logical-input repeat arbiter. It owns at most one hold, never
 /// suppresses a genuine new physical press, and serializes every observation so
-/// a due instant can produce at most one injected repeat. A later native-pressed
-/// signal from a continuously held, preempted input is a repeat rather than a new
-/// physical edge and remains suppressed until that input is released.
+/// a due instant can produce at most one repeat signal. External repeat pulses
+/// are observed for provenance but never become a new physical owner. Every
+/// observed current-owner pulse moves the fallback deadline forward by one
+/// interval, so PulseQueue fills gaps instead of creating a second repeat stream.
+/// A continuously held, preempted input remains suppressed until it is released.
 /// </summary>
 public sealed class LogicalHotbarRepeatEngine
 {
@@ -197,18 +199,8 @@ public sealed class LogicalHotbarRepeatEngine
                 return ObserveReleased(observation, input);
             }
 
+            var wasHeld = input.Held;
             input.Held = true;
-
-            // A release must have been seen for this exact logical input. This
-            // prevents already-held controls at startup from becoming repeaters.
-            if (observation.NativePressed && input.ReleaseObserved)
-            {
-                ClaimNewestOwner(observation, input);
-                return Decision(
-                    LogicalHotbarRepeatDecisionKind.PhysicalPress,
-                    shouldReportPressed: true,
-                    isFreshPhysicalEdge: true);
-            }
 
             if (input.SuppressedUntilRelease)
             {
@@ -216,6 +208,33 @@ public sealed class LogicalHotbarRepeatEngine
                 return Decision(
                     LogicalHotbarRepeatDecisionKind.SuppressedOlderHold,
                     shouldReportPressed: false);
+            }
+
+            // The first native press seen for an eligible, non-suppressed held
+            // input is sufficient to claim it. Requiring a prior per-binding
+            // release made valid first presses inert after startup, hook-order
+            // changes and compatibility refreshes. A preempted older hold is
+            // still protected by SuppressedUntilRelease above.
+            if (observation.NativePressed
+                && ownerLogicalInputId != observation.LogicalInputId)
+            {
+                // A native pulse from another input that was already known held
+                // is typematic/external continuation, not a newer physical edge.
+                // Once another input owns cadence it cannot steal ownership.
+                if (ownerLogicalInputId > 0 && wasHeld)
+                {
+                    input.SuppressedUntilRelease = true;
+                    suppressedOlderHolds++;
+                    return Decision(
+                        LogicalHotbarRepeatDecisionKind.SuppressedOlderHold,
+                        shouldReportPressed: false);
+                }
+
+                ClaimNewestOwner(observation, input);
+                return Decision(
+                    LogicalHotbarRepeatDecisionKind.PhysicalPress,
+                    shouldReportPressed: true,
+                    isFreshPhysicalEdge: true);
             }
 
             if (ownerLogicalInputId != observation.LogicalInputId)
@@ -229,10 +248,15 @@ public sealed class LogicalHotbarRepeatEngine
 
             if (observation.NativePressed)
             {
+                // A native/external pressed result already executes this exact
+                // binding for the current scan. Restart the fallback interval
+                // from that real pulse. If the external source keeps working,
+                // PulseQueue stays silent; if it stops or excludes this binding,
+                // PulseQueue fills the first missing interval.
+                lastRepeatSignalAtMilliseconds = observation.NowMilliseconds;
                 nextRepeatAtMilliseconds = SaturatingAdd(
                     observation.NowMilliseconds,
                     options.RepeatIntervalMilliseconds);
-                lastRepeatSignalAtMilliseconds = observation.NowMilliseconds;
 
                 if (observation.ExternalRepeatOwnerActive)
                 {
@@ -248,7 +272,6 @@ public sealed class LogicalHotbarRepeatEngine
             }
 
             if (!observation.RepeatEnabled
-                || observation.ExternalRepeatOwnerActive
                 || observation.NowMilliseconds < nextRepeatAtMilliseconds
                 || (options.RepeatIntervalMilliseconds == 0
                     && observation.NowMilliseconds == lastRepeatSignalAtMilliseconds))
@@ -264,6 +287,47 @@ public sealed class LogicalHotbarRepeatEngine
             return Decision(
                 LogicalHotbarRepeatDecisionKind.InjectedRepeat,
                 shouldReportPressed: true);
+        }
+    }
+
+    /// <summary>
+    /// Coalesces a repeat that an outer hook produced after this engine returned
+    /// its native result. It can move only the current, still-held owner's
+    /// deadline and can never claim or preempt ownership.
+    /// </summary>
+    public bool CoalesceExternalExecution(long logicalInputId, long nowMilliseconds)
+    {
+        if (logicalInputId <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(logicalInputId),
+                logicalInputId,
+                "The logical input ID must be positive.");
+        }
+
+        if (nowMilliseconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(nowMilliseconds),
+                nowMilliseconds,
+                "The observation time cannot be negative.");
+        }
+
+        lock (gate)
+        {
+            if (ownerLogicalInputId != logicalInputId
+                || !inputs.TryGetValue(logicalInputId, out var input)
+                || !input.Held
+                || input.SuppressedUntilRelease)
+            {
+                return false;
+            }
+
+            lastRepeatSignalAtMilliseconds = nowMilliseconds;
+            nextRepeatAtMilliseconds = SaturatingAdd(
+                nowMilliseconds,
+                options.RepeatIntervalMilliseconds);
+            return true;
         }
     }
 
@@ -291,6 +355,16 @@ public sealed class LogicalHotbarRepeatEngine
 
         if (observation.NativePressed)
         {
+            if (ownerLogicalInputId > 0
+                && ownerLogicalInputId != observation.LogicalInputId)
+            {
+                SuppressOtherHeldInputs(observation.LogicalInputId);
+                holdsPreempted++;
+                ownerLogicalInputId = 0;
+                nextRepeatAtMilliseconds = 0;
+                lastRepeatSignalAtMilliseconds = -1;
+            }
+
             return Decision(
                 LogicalHotbarRepeatDecisionKind.PhysicalPress,
                 shouldReportPressed: true,
@@ -336,6 +410,8 @@ public sealed class LogicalHotbarRepeatEngine
             holdsPreempted++;
         }
 
+        SuppressOtherHeldInputs(observation.LogicalInputId);
+
         ownerLogicalInputId = observation.LogicalInputId;
         input.ReleaseObserved = false;
         input.SuppressedUntilRelease = false;
@@ -346,6 +422,15 @@ public sealed class LogicalHotbarRepeatEngine
                 : options.RepeatIntervalMilliseconds);
         lastRepeatSignalAtMilliseconds = observation.NowMilliseconds;
         holdsClaimed++;
+    }
+
+    private void SuppressOtherHeldInputs(long newestLogicalInputId)
+    {
+        foreach (var pair in inputs)
+        {
+            if (pair.Key == newestLogicalInputId || !pair.Value.Held) continue;
+            pair.Value.SuppressedUntilRelease = true;
+        }
     }
 
     private LogicalHotbarRepeatDecision Decision(

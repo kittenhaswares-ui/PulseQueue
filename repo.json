@@ -5,9 +5,9 @@
     "Punchline": "Held input repeats. Latest real press wins.",
     "Description": "A newest-input smart buffer with native logical-input Turbo and macro support.",
     "InternalName": "PulseQueue.Plugin",
-    "AssemblyVersion": "0.3.4.0",
-    "TestingAssemblyVersion": "0.3.4.0",
-    "Changelog": "Replaces the ineffective manual Turbo path with native logical-input repeat inside FFXIV's standard-hotbar scan. FFXIV resolves the held binding, current action, target, and complete macro; PulseQueue no longer replays ExecuteSlot, actions, or parsed macro lines. A genuine newer press immediately preempts one older smart-buffer intent and exact owned queue, while injected or ReAction-delegated repeats never preempt. ReAction Turbo/Macro Queue are detected and delegated instead of blocking the plugin; NoClippy remains compatible. Timing is configurable from 0 to 1000 ms. Testing scope is standard hotbars, not cross hotbar/controller or direct clicks.",
+    "AssemblyVersion": "0.3.5.0",
+    "TestingAssemblyVersion": "0.3.5.0",
+    "Changelog": "Fixes the live failure where ReAction Turbo made PulseQueue inherit ReAction's combo and macro exclusions. PulseQueue now acts as a same-InputId gap-filler: each observed ReAction/native pulse moves the fallback one interval forward, and PulseQueue resumes only when that stream leaves a gap. Outer-hook pulses are coalesced, Auto Target no longer release-gates combo holds, complete macros retain native Macro mode, and the first native press can claim without a startup release. Newest physical input still wins, older holds remain suppressed until release, and the adaptive one-shot buffer maximum is raised from 180 to 350 ms.",
     "RepoUrl": "https://github.com/kittenhaswares-ui/PulseQueue",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
@@ -23,6 +23,6 @@
     "DownloadLinkInstall": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
     "DownloadLinkUpdate": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
     "DownloadLinkTesting": "https://raw.githubusercontent.com/kittenhaswares-ui/PulseQueue/main/dist/latest.zip",
-    "LastUpdate": "1784737502"
+    "LastUpdate": "1785545011"
   }
 ]

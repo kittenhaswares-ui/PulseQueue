@@ -55,9 +55,10 @@ internal readonly record struct StandardHotbarBinding(
 }
 
 /// <summary>
-/// Settings captured once for a native standard-hotbar binding scan. When an
-/// external repeat owner is active PulseQueue observes/delegates its pulses and
-/// never manufactures a second pulse.
+/// Settings captured once for a native standard-hotbar binding scan. External
+/// repeat pulses pass through and are classified, while PulseQueue retains an
+/// independent same-input fallback deadline for bindings the external owner
+/// does not repeat.
 /// </summary>
 internal readonly record struct NativeHotbarRepeatSettings(
     bool RepeatEnabled,
@@ -138,7 +139,7 @@ internal readonly record struct NativeHotbarRepeatTelemetry(
 internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
 {
     private const string CheckHotbarBindingsSignature = "89 54 24 10 53 41 55 41 57";
-    private const long MaximumCorrelationAgeMilliseconds = 50;
+    private const long MaximumCorrelationAgeMilliseconds = 250;
 
     [ThreadStatic]
     private static PhysicalHotbarInputSource? activeScanSource;
@@ -287,6 +288,12 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
                 activation = candidate;
                 if (pending.Value.CountDelegationOnConsume)
                 {
+                    if (!candidate.SuppressedByNewerInput)
+                    {
+                        repeatEngine.CoalesceExternalExecution(
+                            (long)candidate.Binding.InputId,
+                            nowMilliseconds);
+                    }
                     Interlocked.Increment(ref delegatedRepeats);
                 }
 
@@ -321,6 +328,12 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
             activation = pending.Value.Activation;
             if (pending.Value.CountDelegationOnConsume)
             {
+                if (!activation.SuppressedByNewerInput)
+                {
+                    repeatEngine.CoalesceExternalExecution(
+                        (long)activation.Binding.InputId,
+                        nowMilliseconds);
+                }
                 Interlocked.Increment(ref delegatedRepeats);
             }
 
@@ -470,25 +483,24 @@ internal sealed unsafe class PhysicalHotbarInputSource : IDisposable
                 {
                     case LogicalHotbarRepeatDecisionKind.PhysicalPress:
                         {
-                            var releaseProvenFreshEdge = decision.IsFreshPhysicalEdge;
-                            var press = releaseProvenFreshEdge
+                            var freshPhysicalEdge = decision.IsFreshPhysicalEdge;
+                            var press = freshPhysicalEdge
                                 ? CreatePress(binding, inputData, now)
                                 : GetOrCreateCurrentPress(binding, inputData, now);
                             if (held) currentPresses[binding.Index] = press;
                             else currentPresses[binding.Index] = null;
-                            if (!releaseProvenFreshEdge && settings.ExternalRepeatOwnerActive)
+                            if (!freshPhysicalEdge && settings.ExternalRepeatOwnerActive)
                             {
-                                // A native-pressed signal without a release-proven
-                                // ownership claim may be an outer ReAction pulse at
-                                // startup or after a timing reset. It is never allowed
-                                // to masquerade as the player's newer physical intent.
+                                // A native-pressed signal that did not claim a new
+                                // physical edge may be an outer ReAction pulse. It is
+                                // never allowed to masquerade as newer player intent.
                                 pendingActivations[binding.Index] = new PendingActivation(
                                     new HotbarActivation(HotbarActivationKind.DelegatedRepeat, press, now),
                                     RequiresActiveScan: false,
                                     CountDelegationOnConsume: false);
                                 Interlocked.Increment(ref delegatedRepeats);
                             }
-                            else if (releaseProvenFreshEdge)
+                            else if (freshPhysicalEdge)
                             {
                                 physicalPress = press;
                                 pendingActivations[binding.Index] = new PendingActivation(

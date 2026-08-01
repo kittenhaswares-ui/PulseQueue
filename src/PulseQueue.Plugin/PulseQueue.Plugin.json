@@ -4,7 +4,7 @@
   "Punchline": "Held input repeats. Latest real press wins.",
   "Description": "A newest-input smart buffer with native logical-input Turbo and macro support.",
   "InternalName": "PulseQueue.Plugin",
-  "AssemblyVersion": "0.3.4.0",
+  "AssemblyVersion": "0.3.5.0",
   "RepoUrl": "https://github.com/kittenhaswares-ui/PulseQueue",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,

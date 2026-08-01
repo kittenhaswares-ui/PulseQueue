@@ -77,8 +77,8 @@ $manifest = Read-Source 'src/PulseQueue.Plugin/PulseQueue.Plugin.json' | Convert
 # contract. Native held-input repetition is deliberately a separate layer.
 # ---------------------------------------------------------------------------
 
-Assert-Contains $bufferEngine 'AbsoluteHoldCapMilliseconds\s*=\s*180\s*;' `
-    'The one-shot buffer hard cap is no longer exactly 180 ms.'
+Assert-Contains $bufferEngine 'AbsoluteHoldCapMilliseconds\s*=\s*350\s*;' `
+    'The one-shot buffer hard cap is no longer exactly 350 ms.'
 Assert-Contains $bufferEngine 'pending\s*=\s*null;[\s\S]*BufferDecisionKind\.Dispatch' `
     'The one-shot buffer no longer consumes ownership before dispatch.'
 Assert-Contains $bufferEngine 'ActionFailureKind\.Cooldown' `
@@ -222,8 +222,8 @@ foreach ($kind in @('PhysicalPress', 'InjectedRepeat', 'DelegatedRepeat')) {
 }
 Assert-Contains $physicalInput 'record struct HotbarActivation\([\s\S]*HotbarActivationKind Kind,[\s\S]*CertifiedHotbarPress Press,[\s\S]*bool SuppressedByNewerInput' `
     'Hotbar activation provenance does not include kind, press and preemption state.'
-Assert-Contains $physicalInput 'MaximumCorrelationAgeMilliseconds\s*=\s*50' `
-    'Logical-input-to-slot activation correlation is no longer bounded to 50 ms.'
+Assert-Contains $physicalInput 'MaximumCorrelationAgeMilliseconds\s*=\s*250' `
+    'Logical-input-to-slot activation correlation is no longer bounded to 250 ms.'
 Assert-Contains $physicalInput 'GetSlotById\([\s\S]*candidate\.Binding\.HotbarId,[\s\S]*candidate\.Binding\.SlotId\)[\s\S]*expected\s*!=\s*slot' `
     'Pointer-based activation is not correlated to the exact native hotbar slot.'
 Assert-Contains $physicalInput 'TryFromSlot\(hotbarId,\s*slotId,\s*out var binding\)[\s\S]*pendingActivations\[binding\.Index\]' `
@@ -240,7 +240,7 @@ Assert-NotContains $physicalInput '->ActionQueued\s*=' `
 
 # Dependency-free newest-input arbiter: a real edge always passes, the latest
 # input owns cadence, the old still-held input stays suppressed until release,
-# and an external repeater delegates instead of creating a second pulse.
+# and external pulses never disable PulseQueue's same-input fallback cadence.
 foreach ($kind in @(
     'PhysicalPress',
     'InjectedRepeat',
@@ -255,16 +255,24 @@ Assert-Contains $logicalRepeat 'public sealed class LogicalHotbarRepeatEngine' `
     'The dependency-free LogicalHotbarRepeatEngine is missing.'
 Assert-Contains $logicalRepeat 'lock \(gate\)[\s\S]*observations\+\+' `
     'Logical input ownership decisions are not serialized.'
-Assert-Contains $logicalRepeat 'observation\.NativePressed\s*&&\s*input\.ReleaseObserved[\s\S]*ClaimNewestOwner\([\s\S]*PhysicalPress' `
-    'A release-proven physical press does not immediately become the newest owner.'
+Assert-Contains $logicalRepeat 'observation\.NativePressed[\s\S]*ownerLogicalInputId\s*!=\s*observation\.LogicalInputId[\s\S]*ClaimNewestOwner\([\s\S]*PhysicalPress' `
+    'A first native press does not immediately become the newest owner.'
+Assert-Contains $logicalRepeat 'ownerLogicalInputId\s*>\s*0\s*&&\s*wasHeld[\s\S]*SuppressedOlderHold' `
+    'An external/native pulse from an older continuously held input can steal newest-input ownership.'
 Assert-Contains $logicalRepeat 'input\.SuppressedUntilRelease[\s\S]*SuppressedOlderHold[\s\S]*shouldReportPressed:\s*false' `
     'A preempted still-held input can be reported pressed again before release.'
 Assert-Contains $logicalRepeat 'ownerLogicalInputId\s*>\s*0\s*&&\s*ownerLogicalInputId\s*!=\s*observation\.LogicalInputId[\s\S]*previousOwner\.SuppressedUntilRelease\s*=\s*previousOwner\.Held;[\s\S]*ownerLogicalInputId\s*=\s*observation\.LogicalInputId' `
     'Newest logical input does not atomically preempt and suppress the old owner.'
-Assert-Contains $logicalRepeat '!observation\.RepeatEnabled[\s\S]*observation\.ExternalRepeatOwnerActive[\s\S]*observation\.NowMilliseconds\s*<\s*nextRepeatAtMilliseconds' `
-    'Repeat injection can bypass enablement, external ownership or cadence.'
+Assert-Contains $logicalRepeat '!observation\.RepeatEnabled[\s\S]*observation\.NowMilliseconds\s*<\s*nextRepeatAtMilliseconds' `
+    'Repeat injection can bypass enablement or cadence.'
+Assert-NotContains $logicalRepeat '!observation\.RepeatEnabled\s*\|\|\s*observation\.ExternalRepeatOwnerActive' `
+    'An external repeater can still disable PulseQueue fallback cadence.'
 Assert-Contains $logicalRepeat 'observation\.ExternalRepeatOwnerActive[\s\S]*delegatedRepeats\+\+;[\s\S]*DelegatedRepeat' `
-    'An external repeat owner is not delegated without duplicate injection.'
+    'Observed external repeat pulses are not classified distinctly.'
+Assert-Contains $logicalRepeat 'if \(observation\.NativePressed\)[\s\S]*lastRepeatSignalAtMilliseconds\s*=\s*observation\.NowMilliseconds;[\s\S]*nextRepeatAtMilliseconds\s*=\s*SaturatingAdd\([\s\S]*observation\.NowMilliseconds,[\s\S]*options\.RepeatIntervalMilliseconds' `
+    'A current-owner native/external pulse does not restart the fallback interval.'
+Assert-Contains $logicalRepeat 'public bool CoalesceExternalExecution\([\s\S]*ownerLogicalInputId\s*!=\s*logicalInputId[\s\S]*input\.SuppressedUntilRelease[\s\S]*nextRepeatAtMilliseconds\s*=\s*SaturatingAdd\(' `
+    'An outer-hook external execution cannot be coalesced without claiming ownership.'
 Assert-Contains $logicalRepeat 'injectedRepeats\+\+;[\s\S]*nextRepeatAtMilliseconds\s*=\s*SaturatingAdd\([\s\S]*observation\.NowMilliseconds,[\s\S]*options\.RepeatIntervalMilliseconds\)' `
     'Injected repeat cadence catches up from an old deadline instead of scheduling from now.'
 Assert-Contains $logicalRepeat 'input\.ReleaseObserved\s*=\s*true;[\s\S]*input\.SuppressedUntilRelease\s*=\s*false;' `
@@ -393,21 +401,19 @@ Assert-Contains $useAction 'var suppressSyntheticMacroCall\s*=\s*staleLogicalRep
 Assert-Contains $useAction 'var logicalRepeatInput\s*=\s*directLogicalRepeatInput\s*\|\|\s*asynchronousLogicalRepeatInput;[\s\S]*if \(!suppressSyntheticMacroCall[\s\S]*&&\s*!logicalRepeatInput[\s\S]*&&\s*!replaying[\s\S]*&&\s*!turboDispatching\)[\s\S]*Cancel\(CancelReason\.Replaced,' `
     'A current asynchronous Macro repeat tail can enter generic newer-input cancellation.'
 
-# Detect-only mode may observe, but it may not inject, convert Macro Queue mode,
-# claim queue ownership, or clear ActionQueued.
+# Detect-only mode may observe, but it may not inject, claim queue ownership, or
+# clear ActionQueued. Macro mode is never converted by the repeat path.
 $nativeRepeatSettings = Get-MethodBlock $runtime `
     'private NativeHotbarRepeatSettings GetNativeHotbarRepeatSettings\(\)' `
     'GetNativeHotbarRepeatSettings'
-$canOwnNativeMacroQueue = Get-MethodBlock $runtime `
-    'private bool CanOwnNativeMacroQueue\(\)' `
-    'CanOwnNativeMacroQueue'
 $canReplaceOwnedQueues = Get-MethodBlock $runtime `
     'private bool CanReplaceOwnedQueuesForNewestInput\(\)' `
     'CanReplaceOwnedQueuesForNewestInput'
+$requiresNativeInputRelease = Get-MethodBlock $runtime `
+    'private static bool RequiresNativeInputRelease\([^\)]*\)' `
+    'RequiresNativeInputRelease'
 Assert-Contains $nativeRepeatSettings 'var featureEnabled\s*=\s*pluginOperational[\s\S]*&&\s*configuration\.TurboEnabled[\s\S]*&&\s*!configuration\.DryRun' `
     'Dry-run can still inject native held-input repeats.'
-Assert-Contains $canOwnNativeMacroQueue 'configuration\.Enabled[\s\S]*&&\s*configuration\.TurboMacrosEnabled[\s\S]*&&\s*!configuration\.DryRun' `
-    'Dry-run can still convert native Macro Queue mode.'
 Assert-Contains $tryCreateLogicalRepeatQueue 'configuration\.DryRun[\s\S]*return null;' `
     'Dry-run can still create repeat-native queue provenance.'
 Assert-Contains $processLogicalRepeatQueue 'configuration\.DryRun[\s\S]*logicalRepeatQueueOwnership\.Clear\(\);[\s\S]*return;' `
@@ -416,22 +422,24 @@ Assert-Contains $replaceLogicalRepeatQueue 'if \(actionManager\s*==\s*null\s*\|\
     'Dry-run does not guard the repeat-owned ActionQueued mutation.'
 Assert-Contains $canReplaceOwnedQueues 'configuration\.Enabled[\s\S]*&&\s*!configuration\.DryRun[\s\S]*&&\s*!faulted[\s\S]*&&\s*!disposed' `
     'Newest-input native queue replacement is not disabled in dry-run.'
+Assert-NotContains $requiresNativeInputRelease 'CancelReason\.TargetChange' `
+    'Target changes still release-gate native held-input cadence and can break ReAction Auto Target combos.'
 Assert-Contains $physicalPreemption 'if \(configuration\.DryRun\)[\s\S]*AbandonOwnedQueueProvenanceForDetectOnly\(\);[\s\S]*else if \(CanReplaceOwnedQueuesForNewestInput\(\)\s*&&\s*actionManager\s*!=\s*null\)[\s\S]*TryReplaceLogicalRepeatNativeQueue\(' `
     'The physical edge can mutate repeat-owned queue state before the dry-run gate.'
 
 # Macro repeat remains arbitrary native macro execution. No repeat-path parser,
-# transcript, action whitelist or target selector may be introduced.
+# transcript, action whitelist, mode conversion or target selector may be introduced.
 Assert-NotContains ($physicalInput + "`n" + $logicalRepeat) 'MacroSafetyAnalyzer|MacroTurboTranscript|TryReadSafeMacroProfile|ActionCommands|HarmlessMetadataCommands' `
     'The native repeat path parses or whitelists macro content.'
-Assert-Contains $useAction 'var nativeMode\s*=\s*mode\s*==\s*ActionManager\.UseActionMode\.Macro[\s\S]*&&\s*CanOwnNativeMacroQueue\(\)[\s\S]*\?\s*ActionManager\.UseActionMode\.None[\s\S]*:\s*mode;' `
-    'Macro mode conversion is not isolated behind the audited PulseQueue ownership gate.'
-Assert-Count $useAction 'ActionManager\.UseActionMode\.None\s*\r?\n\s*:\s*mode' 1 `
-    'Macro UseAction mode has more than one plugin-side conversion boundary.'
+Assert-Contains $useAction 'var nativeMode\s*=\s*mode;' `
+    'The native repeat path no longer preserves FFXIV Macro mode exactly.'
+Assert-NotContains $useAction 'var nativeMode\s*=\s*mode\s*==\s*ActionManager\.UseActionMode\.Macro' `
+    'The native repeat path still converts Macro mode.'
 
 # ---------------------------------------------------------------------------
-# ReAction coexistence is feature-granular. Supported Turbo/Macro Queue are
-# delegated capabilities, while unknown/unreadable ReAction never globally
-# suspends PulseQueue. NoClippy and MOAction keep their separate audited rules.
+# ReAction coexistence is feature-granular. Its pulses and Macro Queue mode are
+# observed capabilities, while unknown/unreadable ReAction never globally
+# suspends the same-input fallback. NoClippy and MOAction keep separate rules.
 # ---------------------------------------------------------------------------
 
 Assert-Contains $compatibility 'ReActionTurboHotbarsEnabled\s*\{\s*get;\s*init;\s*\}' `
@@ -462,14 +470,16 @@ Assert-Contains $assessReAction 'ReAction features are capabilities, not global 
 Assert-Contains $compatibility 'WeakReference<object>' `
     'The live ReAction capability guard strongly retains the foreign plugin.'
 
-# Runtime delegates only when the audited ReAction feature is known active;
-# unknown ReAction falls back to PulseQueue's own native logical repeat path.
+# Runtime records the audited ReAction capabilities for telemetry and exact
+# pulse provenance, but PulseQueue always retains its own fallback cadence.
 Assert-Contains $runtime 'reActionTurboHotbarsEnabled\s*=\s*assessment\.ReActionAudited[\s\S]*&&\s*assessment\.ReActionTurboHotbarsEnabled;' `
-    'Runtime does not require an audited active ReAction Turbo capability before delegating.'
+    'Runtime does not require an audited active ReAction Turbo capability before classifying external pulses.'
 Assert-Contains $runtime 'reActionMacroQueueEnabled\s*=\s*assessment\.ReActionAudited[\s\S]*&&\s*assessment\.ReActionMacroQueueEnabled;' `
     'Runtime does not require an audited active ReAction Macro Queue capability before deferring.'
 Assert-Contains $runtime 'ExternalRepeatOwnerActive:\s*reActionRepeatActive' `
-    'ReAction repeat ownership is not passed to the logical input arbiter.'
+    'ReAction pulse provenance is not passed to the logical input arbiter.'
+Assert-Contains $runtime 'MaximumFrameGapMilliseconds\s*=\s*1_000' `
+    'Native-input ownership is still cancelled by an overly narrow frame-gap threshold.'
 
 # Global timing/mutation guardrails. Repetition is driven only by native binding
 # scans; there is no background timer and testing builds stay testing-exclusive.

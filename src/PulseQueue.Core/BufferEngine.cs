@@ -50,7 +50,7 @@ public readonly record struct BufferDecision(
 
 public sealed class BufferEngine
 {
-    public const int AbsoluteHoldCapMilliseconds = 180;
+    public const int AbsoluteHoldCapMilliseconds = 350;
 
     private readonly object gate = new();
     private ArmedIntent? pending;
